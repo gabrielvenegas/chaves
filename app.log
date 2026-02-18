@@ -1,0 +1,5 @@
+
+> start
+> tsx src/index.ts
+
+Enter project path to watch (default: /Users/gabrielvenegas/Projects/edith): 
