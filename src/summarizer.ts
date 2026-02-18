@@ -104,6 +104,28 @@ Keep it short and actionable. No fluff.`;
     }
   }
 
+  buildDiffSummaryPrompt(
+    diffSummary: string,
+    previousSummary?: string,
+  ): string {
+    const languageInstructions = this.getLanguageInstructions();
+
+    return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
+
+You are Chaves, a coding companion. Summarize the following file diffs and changes. Focus on intent, scope, and next steps.
+
+${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}${diffSummary}
+
+${languageInstructions}
+
+Respond with:
+1. **Current Focus**: What file/feature we're working on (1 line)
+2. **Recent Steps**: What we just did (1 line)
+3. **Likely Next**: What we might do next based on pattern (1 line)
+
+Keep it short and actionable. No fluff.`;
+  }
+
   private getLanguageInstructions(): string {
     const instructions: Record<string, string> = {
       en: "Respond in English. Your entire response must be in English.",

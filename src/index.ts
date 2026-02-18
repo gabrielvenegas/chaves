@@ -1,4 +1,6 @@
 import { createInterface } from "readline/promises";
+import { createOpenAI } from "@ai-sdk/openai";
+import { generateText } from "ai";
 import { logger } from "./logger.js";
 import { Store } from "./store.js";
 import { Summarizer } from "./summarizer.js";
@@ -61,6 +63,10 @@ async function main() {
   const configuredLanguage = store.getLanguage();
   const watcher = new Watcher(projectPath);
   const summarizer = new Summarizer(configuredModel, configuredLanguage);
+  const diffClient = createOpenAI({
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey: process.env.OPENROUTER_API_KEY,
+  });
   const ui = new UI();
 
   let eventsSinceLastSummary = 0;
@@ -164,6 +170,57 @@ async function main() {
     );
 
     await runSummaryIfNeeded();
+  });
+
+  watcher.on("summarize", async (payload) => {
+    logger.debug("APP", "📨 Received summarize event", {
+      changeCount: payload.changes.length,
+    });
+
+    if (!payload.prompt) {
+      return;
+    }
+
+    try {
+      const prompt = summarizer.buildDiffSummaryPrompt(
+        payload.prompt,
+        lastSummary?.content,
+      );
+
+      const changesJson = JSON.stringify(payload.changes);
+      store.saveDiffSnapshot(
+        payload.prompt,
+        changesJson,
+        payload.changes.length,
+      );
+
+      logger.aiRequest(prompt.length);
+
+      const { text } = await generateText({
+        model: diffClient(configuredModel),
+        maxTokens: 300,
+        prompt,
+      });
+
+      if (text.trim().length === 0) {
+        throw new Error("Empty summary returned from AI provider");
+      }
+
+      store.saveSummary(text, lastSummarizedEventId, lastSummarizedEventId);
+      lastSummary = { content: text, event_range_end: lastSummarizedEventId };
+      ui.showSummary(text);
+
+      logger.info("APP", "✅ Diff summary generation complete");
+    } catch (err) {
+      logger.error("APP", "❌ Diff summary generation failed:", err);
+
+      if (err instanceof Error) {
+        logger.error("APP", `Error details: ${err.message}`);
+        logger.debug("APP", `Error stack:`, err.stack);
+      }
+
+      console.error("Diff summary generation failed:", err);
+    }
   });
 
   watcher.start();

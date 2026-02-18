@@ -53,6 +53,13 @@ export class Store {
         event_range_start INTEGER,
         event_range_end INTEGER
       );
+      CREATE TABLE IF NOT EXISTS diff_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        change_count INTEGER NOT NULL,
+        prompt TEXT NOT NULL,
+        changes_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -146,6 +153,24 @@ export class Store {
       .run(new Date().toISOString(), content, eventRangeStart, eventRangeEnd);
 
     logger.storeSaveSummary(eventCount);
+  }
+
+  saveDiffSnapshot(prompt: string, changesJson: string, changeCount: number) {
+    const timestamp = new Date().toISOString();
+
+    logger.debug("STORE", "Saving diff snapshot", {
+      changeCount,
+      promptLength: prompt.length,
+    });
+
+    this.db
+      .prepare(
+        `
+      INSERT INTO diff_snapshots (timestamp, change_count, prompt, changes_json)
+      VALUES (?, ?, ?, ?)
+    `,
+      )
+      .run(timestamp, changeCount, prompt, changesJson);
   }
 
   getLastSummary(): { content: string; event_range_end: number } | null {

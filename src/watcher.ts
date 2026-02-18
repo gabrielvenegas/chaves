@@ -2,12 +2,14 @@ import chokidar from "chokidar";
 import { EventEmitter } from "events";
 import { relative } from "path";
 import { logger } from "./logger.js";
+import { DiffTracker, type FileChange } from "./diff-tracker.js";
 import type { EventType } from "./store.js";
 
 export interface WatcherEvent {
   type: EventType;
   path: string;
   details?: string;
+  change?: FileChange | null;
 }
 
 export class Watcher extends EventEmitter {
@@ -15,9 +17,11 @@ export class Watcher extends EventEmitter {
   private idleTimer: NodeJS.Timeout | null = null;
   private isIdle = false;
   private readonly idleThreshold = 30_000;
+  private diffTracker: DiffTracker;
 
   constructor(private projectPath: string) {
     super();
+    this.diffTracker = new DiffTracker(projectPath);
     logger.debug("WATCHER", `Watcher constructed for: ${projectPath}`);
   }
 
@@ -42,9 +46,15 @@ export class Watcher extends EventEmitter {
     });
 
     this.watcher
-      .on("add", (path) => this.handleEvent("file_create", path))
-      .on("change", (path) => this.handleEvent("file_change", path))
-      .on("unlink", (path) => this.handleEvent("file_delete", path))
+      .on("add", (path) => {
+        void this.handleEvent("file_create", path);
+      })
+      .on("change", (path) => {
+        void this.handleEvent("file_change", path);
+      })
+      .on("unlink", (path) => {
+        void this.handleEvent("file_delete", path);
+      })
       .on("ready", () => {
         logger.info("WATCHER", "✅ Watcher ready and listening for changes");
       })
@@ -55,11 +65,13 @@ export class Watcher extends EventEmitter {
     this.resetIdleTimer();
   }
 
-  private handleEvent(type: EventType, fullPath: string) {
+  private async handleEvent(type: EventType, fullPath: string) {
     const path = relative(this.projectPath, fullPath);
 
     logger.watcherEvent(type, path);
     logger.debug("WATCHER", `Full path: ${fullPath}`);
+
+    const change = await this.diffTracker.handleEvent(type, fullPath);
 
     if (this.isIdle) {
       this.isIdle = false;
@@ -81,8 +93,12 @@ export class Watcher extends EventEmitter {
         break;
     }
 
-    this.emit("event", { type, path } as WatcherEvent);
+    this.emit("event", { type, path, change } as WatcherEvent);
     logger.debug("WATCHER", `Emitted event: ${type} for ${path}`);
+
+    if (this.diffTracker.pendingCount > 10) {
+      this.triggerSummarization();
+    }
   }
 
   private resetIdleTimer() {
@@ -100,13 +116,38 @@ export class Watcher extends EventEmitter {
         details: "No activity detected",
       });
       logger.debug("WATCHER", "Emitted idle_start event");
+      this.triggerSummarization();
     }, this.idleThreshold);
 
     logger.debug("WATCHER", `Idle timer set for ${this.idleThreshold}ms`);
   }
 
+  private triggerSummarization() {
+    const changes = this.diffTracker.flushChanges();
+
+    if (changes.length === 0) return;
+
+    const prompt = this.diffTracker.formatForLLM(changes);
+
+    this.emit("summarize", {
+      type: "summarize",
+      changes,
+      prompt,
+      timestamp: Date.now(),
+    });
+
+    logger.info(
+      "WATCHER",
+      `📝 Triggering summarization for ${changes.length} changes`,
+    );
+  }
+
   stop() {
     logger.info("WATCHER", "🛑 Stopping watcher...");
+
+    if (this.diffTracker.hasPendingChanges) {
+      this.triggerSummarization();
+    }
 
     if (this.watcher) {
       this.watcher.close();
