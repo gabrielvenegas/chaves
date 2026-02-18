@@ -1,4 +1,0 @@
-This is a test file to verify the watcher is working.
-
-Created at: 2025-01-16
-Purpose: Test file system monitoring
