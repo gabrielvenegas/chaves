@@ -9,11 +9,11 @@ import { UI } from "./ui.js";
 import { Watcher } from "./watcher.js";
 import { runSetup } from "./setup.js";
 
-const SUMMARY_THRESHOLD = parseEnvInt("CHAVES_SUMMARY_THRESHOLD", 10);
+const SUMMARY_THRESHOLD = parseEnvInt("CHAVES_SUMMARY_THRESHOLD", 15);
 const SUMMARY_MIN_UNIQUE_FILES = parseEnvInt("CHAVES_SUMMARY_MIN_FILES", 2);
 const SUMMARY_MIN_COUNTABLE_EVENTS = parseEnvInt(
   "CHAVES_SUMMARY_MIN_EVENTS",
-  6,
+  10,
 );
 
 function parseEnvInt(name: string, fallback: number): number {
