@@ -316,6 +316,8 @@ CHAVES_DEBUG=true bun run start
 
 **Solutions**:
 
+You can tune the summary heuristics with environment variables: `CHAVES_SUMMARY_THRESHOLD` (default 10), `CHAVES_SUMMARY_MIN_EVENTS` (default 6), and `CHAVES_SUMMARY_MIN_FILES` (default 2). These control when event-based summaries trigger based on countable events and unique files (idle events are excluded).
+
 1. **Check API key**: Verify `OPENROUTER_API_KEY` is set:
 
    ```bash

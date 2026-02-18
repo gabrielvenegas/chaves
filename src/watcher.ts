@@ -135,11 +135,6 @@ export class Watcher extends EventEmitter {
       prompt,
       timestamp: Date.now(),
     });
-
-    logger.info(
-      "WATCHER",
-      `📝 Triggering summarization for ${changes.length} changes`,
-    );
   }
 
   stop() {

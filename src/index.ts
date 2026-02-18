@@ -1,14 +1,52 @@
 import { createInterface } from "readline/promises";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
+import { createHash } from "crypto";
 import { logger } from "./logger.js";
-import { Store } from "./store.js";
+import { Store, type ActivityEvent } from "./store.js";
 import { Summarizer } from "./summarizer.js";
 import { UI } from "./ui.js";
 import { Watcher } from "./watcher.js";
 import { runSetup } from "./setup.js";
 
-const SUMMARY_THRESHOLD = 10; // Generate summary every N events
+const SUMMARY_THRESHOLD = parseEnvInt("CHAVES_SUMMARY_THRESHOLD", 10);
+const SUMMARY_MIN_UNIQUE_FILES = parseEnvInt("CHAVES_SUMMARY_MIN_FILES", 2);
+const SUMMARY_MIN_COUNTABLE_EVENTS = parseEnvInt(
+  "CHAVES_SUMMARY_MIN_EVENTS",
+  6,
+);
+
+function parseEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isCountableEventType(type: ActivityEvent["event_type"]): boolean {
+  return type !== "idle_start" && type !== "idle_end";
+}
+
+function isCountableEvent(event: ActivityEvent): boolean {
+  return isCountableEventType(event.event_type);
+}
+
+function buildEventLog(events: ActivityEvent[]): string {
+  return events
+    .map((e) => `[${e.timestamp}] ${e.event_type}: ${e.file_path}`)
+    .join("\n");
+}
+
+function getUniqueFileCount(events: ActivityEvent[]): number {
+  const unique = new Set(
+    events.map((event) => event.file_path).filter(Boolean),
+  );
+  return unique.size;
+}
+
+function hashPrompt(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex");
+}
 
 async function main() {
   const defaultPath = process.argv[2] || process.cwd();
@@ -72,6 +110,7 @@ async function main() {
   let eventsSinceLastSummary = 0;
   let lastSummarizedEventId = store.getLastSummary()?.event_range_end ?? 0;
   let isSummarizing = false;
+  let lastEventSummaryPromptHash: string | null = null;
 
   logger.debug("APP", `Last summarized event ID: ${lastSummarizedEventId}`);
 
@@ -96,33 +135,80 @@ async function main() {
 
     try {
       const newEvents = store.getEventsSince(lastSummarizedEventId);
-      logger.debug("APP", `Fetched ${newEvents.length} new events for summary`);
+      const countableEvents = newEvents.filter(isCountableEvent);
 
-      if (newEvents.length > 0) {
-        const startTime = Date.now();
+      logger.debug(
+        "APP",
+        `Fetched ${newEvents.length} new events for summary`,
+        {
+          countableEvents: countableEvents.length,
+        },
+      );
 
-        const summary = await summarizer.generateSummary(
-          newEvents,
-          lastSummary?.content,
-        );
+      if (countableEvents.length === 0) {
+        logger.warn("APP", "No countable events to summarize (unexpected)");
+        return;
+      }
 
-        const lastEventId = newEvents.at(-1)?.id!;
-        logger.debug("APP", `Last event ID in batch: ${lastEventId}`);
+      const lastEventId = newEvents.at(-1)?.id;
+      if (!lastEventId) {
+        logger.warn("APP", "No last event ID available for summary");
+        return;
+      }
 
-        store.saveSummary(summary, lastSummarizedEventId, lastEventId);
+      const uniqueFileCount = getUniqueFileCount(countableEvents);
+      const eventLog = buildEventLog(countableEvents);
+      const prompt = summarizer.buildEventSummaryPrompt(
+        eventLog,
+        lastSummary?.content,
+      );
+      const promptHash = hashPrompt(prompt);
 
-        lastSummarizedEventId = lastEventId;
-        lastSummary = { content: summary, event_range_end: lastEventId };
-        ui.showSummary(summary);
+      const isMeaningful =
+        countableEvents.length >= SUMMARY_MIN_COUNTABLE_EVENTS ||
+        uniqueFileCount >= SUMMARY_MIN_UNIQUE_FILES;
 
-        const duration = Date.now() - startTime;
+      if (!isMeaningful) {
         logger.info(
           "APP",
-          `✅ Summary generation complete (${duration}ms total)`,
+          "⏭️  Summary skipped (not enough meaningful change)",
+          {
+            countableEvents: countableEvents.length,
+            uniqueFiles: uniqueFileCount,
+          },
         );
-      } else {
-        logger.warn("APP", "No new events to summarize (unexpected)");
+        lastSummarizedEventId = lastEventId;
+        return;
       }
+
+      if (lastEventSummaryPromptHash === promptHash) {
+        logger.info("APP", "⏭️  Summary skipped (prompt unchanged)");
+        lastSummarizedEventId = lastEventId;
+        return;
+      }
+
+      const startTime = Date.now();
+
+      const summary = await summarizer.generateSummary(
+        countableEvents,
+        lastSummary?.content,
+      );
+
+      lastEventSummaryPromptHash = promptHash;
+
+      logger.debug("APP", `Last event ID in batch: ${lastEventId}`);
+
+      store.saveSummary(summary, lastSummarizedEventId, lastEventId);
+
+      lastSummarizedEventId = lastEventId;
+      lastSummary = { content: summary, event_range_end: lastEventId };
+      ui.showSummary(summary);
+
+      const duration = Date.now() - startTime;
+      logger.info(
+        "APP",
+        `✅ Summary generation complete (${duration}ms total)`,
+      );
     } catch (err) {
       logger.error("APP", "❌ Summary generation failed:", err);
 
@@ -135,8 +221,8 @@ async function main() {
       console.error("Summary generation failed:", err);
     } finally {
       isSummarizing = false;
-      const pendingCount = store.getEventsSince(lastSummarizedEventId).length;
-      eventsSinceLastSummary = pendingCount;
+      const pendingEvents = store.getEventsSince(lastSummarizedEventId);
+      eventsSinceLastSummary = pendingEvents.filter(isCountableEvent).length;
 
       logger.debug(
         "APP",
@@ -162,7 +248,10 @@ async function main() {
     });
 
     ui.logEvent(saved);
-    eventsSinceLastSummary++;
+
+    if (isCountableEventType(saved.event_type)) {
+      eventsSinceLastSummary++;
+    }
 
     logger.debug(
       "APP",
@@ -209,8 +298,6 @@ async function main() {
       store.saveSummary(text, lastSummarizedEventId, lastSummarizedEventId);
       lastSummary = { content: text, event_range_end: lastSummarizedEventId };
       ui.showSummary(text);
-
-      logger.info("APP", "✅ Diff summary generation complete");
     } catch (err) {
       logger.error("APP", "❌ Diff summary generation failed:", err);
 

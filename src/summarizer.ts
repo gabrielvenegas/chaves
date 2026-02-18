@@ -47,24 +47,7 @@ export class Summarizer {
 
     logger.debug("AI", "Event log:", eventLog);
 
-    const languageInstructions = this.getLanguageInstructions();
-
-    const prompt = `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
-
-You are Chaves, a coding companion. Analyze these recent IDE activity events and provide a concise, helpful summary of what the developer is working on.
-
-${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}
-Recent activity:
-${eventLog}
-
-${languageInstructions}
-
-Respond with:
-1. **Current Focus**: What file/feature we're working on (1 line)
-2. **Recent Steps**: What we just did (1 line)
-3. **Likely Next**: What we might do next based on pattern (1 line)
-
-Keep it short and actionable. No fluff.`;
+    const prompt = this.buildEventSummaryPrompt(eventLog, previousSummary);
 
     logger.aiRequest(prompt.length);
     logger.debug("AI", `Prompt length: ${prompt.length} characters`);
@@ -80,7 +63,6 @@ Keep it short and actionable. No fluff.`;
         prompt,
       });
 
-      console.log("TEXT: ", text);
       const duration = Date.now() - startTime;
 
       logger.aiResponse(text.length);
@@ -102,6 +84,27 @@ Keep it short and actionable. No fluff.`;
 
       throw error;
     }
+  }
+
+  buildEventSummaryPrompt(eventLog: string, previousSummary?: string): string {
+    const languageInstructions = this.getLanguageInstructions();
+
+    return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
+
+You are Chaves, a coding companion. Analyze these recent IDE activity events and provide a concise, helpful summary of what the developer is working on.
+
+${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}
+Recent activity:
+${eventLog}
+
+${languageInstructions}
+
+Respond with:
+1. **Current Focus**: What file/feature we're working on (1 line)
+2. **Recent Steps**: What we just did (1 line)
+3. **Likely Next**: What we might do next based on pattern (1 line)
+
+Keep it short and actionable. No fluff.`;
   }
 
   buildDiffSummaryPrompt(
