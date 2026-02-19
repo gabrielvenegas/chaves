@@ -99,12 +99,7 @@ ${eventLog}
 
 ${languageInstructions}
 
-Respond with:
-1. **Current Focus**: What file/feature we're working on (1 line)
-2. **Recent Steps**: What we just did (1 line)
-3. **Likely Next**: What we might do next based on pattern (1 line)
-
-Keep it short and actionable. No fluff.`;
+Write a brief, conversational summary in 2–3 sentences. Mention the current focus and recent steps, then suggest a likely next step in natural language. If a meaningful clarification is needed, include one short question. Avoid bullet points and numbered lists. Keep it concise and actionable, but friendly.`;
   }
 
   buildDiffSummaryPrompt(
@@ -121,12 +116,7 @@ ${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}${diffSumma
 
 ${languageInstructions}
 
-Respond with:
-1. **Current Focus**: What file/feature we're working on (1 line)
-2. **Recent Steps**: What we just did (1 line)
-3. **Likely Next**: What we might do next based on pattern (1 line)
-
-Keep it short and actionable. No fluff.`;
+Write a brief, conversational summary in 2–3 sentences. Mention the current focus and recent steps, then suggest a likely next step in natural language. If a meaningful clarification is needed, include one short question. Avoid bullet points and numbered lists. Keep it concise and actionable, but friendly.`;
   }
 
   buildChatPrompt(userMessage: string, previousSummary?: string): string {
@@ -160,6 +150,6 @@ Keep it concise and actionable. No fluff.`;
       zh: "请用中文回答。您的回答必须完全用中文。",
     };
 
-    return instructions[this.language] || instructions.en;
+    return String(instructions[this.language] ?? instructions.en);
   }
 }
