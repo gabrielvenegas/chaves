@@ -129,6 +129,21 @@ Respond with:
 Keep it short and actionable. No fluff.`;
   }
 
+  buildChatPrompt(userMessage: string, previousSummary?: string): string {
+    const languageInstructions = this.getLanguageInstructions();
+
+    return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
+
+You are Chaves, a coding companion. Respond to the user's message clearly and helpfully, using recent project context when it adds value.
+
+${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}User message:
+${userMessage}
+
+${languageInstructions}
+
+Keep it concise and actionable. No fluff.`;
+  }
+
   private getLanguageInstructions(): string {
     const instructions: Record<string, string> = {
       en: "Respond in English. Your entire response must be in English.",

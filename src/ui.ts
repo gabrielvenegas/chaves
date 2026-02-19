@@ -1,50 +1,87 @@
-import chalk from "chalk";
-import { readFileSync } from "fs";
 import { MarkdownRenderer } from "./markdown/renderer.js";
 import { logger } from "./logger.js";
 import type { ActivityEvent } from "./store.js";
+import { createChatUI, type ChatMessage, type ChatUI } from "./ui/chat.js";
+
+type UserMessageHandler = (text: string) => Promise<void> | void;
 
 export class UI {
   private lastSummary = "";
   private markdownRenderer: MarkdownRenderer;
+  private chat: ChatUI;
+  private eventBuffer: ActivityEvent[] = [];
+  private readonly maxEventBuffer = 8;
+  private userHandler: UserMessageHandler | null = null;
 
   constructor() {
-    logger.debug("UI", "UI component initialized");
+    logger.debug("UI", "UI component initialized (blessed chat)");
     this.markdownRenderer = new MarkdownRenderer();
+    this.chat = createChatUI({
+      title: "CHAVES",
+      initialStatus: "Watching…",
+    });
+    this.chat.startWatchingIndicator();
+  }
+
+  onUserMessage(handler: UserMessageHandler) {
+    this.userHandler = handler;
+    this.chat.onSubmit(async (text) => {
+      this.pushMessage({
+        role: "user",
+        content: text,
+        timestamp: Date.now(),
+      });
+
+      try {
+        await this.userHandler?.(text);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Unknown error";
+        this.showError("Failed to handle user message", error as Error);
+        logger.error("UI", "User handler failed", message);
+      }
+    });
   }
 
   logEvent(event: ActivityEvent) {
-    const time = new Date(event.timestamp).toLocaleTimeString();
-    const icon = this.getIcon(event.event_type);
-
-    logger.debug("UI", `Displaying event #${event.id}`, {
+    logger.debug("UI", `Buffering event #${event.id}`, {
       type: event.event_type,
       path: event.file_path,
       timestamp: event.timestamp,
     });
 
-    console.log(
-      chalk.dim(`[${time}]`),
-      icon,
-      chalk.cyan(event.file_path || event.event_type),
-    );
-
-    logger.debug("UI", `Event #${event.id} displayed to console`);
+    this.eventBuffer.push(event);
+    if (this.eventBuffer.length > this.maxEventBuffer) {
+      this.eventBuffer = this.eventBuffer.slice(-this.maxEventBuffer);
+    }
   }
 
   private getIcon(type: string): string {
     const icons: Record<string, string> = {
       file_create: "📄",
-      file_change: "✏️ ",
-      file_delete: "🗑️ ",
+      file_change: "✏️",
+      file_delete: "🗑️",
       idle_start: "💤",
       idle_end: "⚡",
     };
 
-    const icon = icons[type] || "•";
-    logger.debug("UI", `Icon for ${type}: ${icon}`);
+    return icons[type] ?? "•";
+  }
 
-    return icon;
+  private formatEventLine(event: ActivityEvent): string {
+    const icon = this.getIcon(event.event_type);
+    const label = event.file_path || event.event_type;
+    return `- ${icon} ${label}`;
+  }
+
+  private renderEventsBlock(): string {
+    if (this.eventBuffer.length === 0) return "";
+    const lines = this.eventBuffer.map((event) => this.formatEventLine(event));
+    return `💭 Events\n${lines.join("\n")}\n`;
+  }
+
+  private pushMessage(message: ChatMessage) {
+    this.chat.pushMessage(message);
   }
 
   async showSummary(summary: string) {
@@ -54,16 +91,19 @@ export class UI {
     }
 
     logger.debug("UI", `Showing new summary (${summary.length} chars)`);
-    logger.debug("UI", "Summary content:", summary);
-
     this.lastSummary = summary;
+
+    const eventsBlock = this.renderEventsBlock();
 
     try {
       const renderedSummary = await this.markdownRenderer.render(summary);
-      if (renderedSummary.trim().length > 0) {
-        console.log(`\n\n${renderedSummary}`);
-      } else {
-        logger.debug("UI", "Glow rendered directly to stdout; skipping echo");
+      const content = `${eventsBlock}${renderedSummary}`.trim();
+      if (content.length > 0) {
+        this.pushMessage({
+          role: "assistant",
+          content,
+          timestamp: Date.now(),
+        });
       }
     } catch (error) {
       logger.error(
@@ -71,60 +111,71 @@ export class UI {
         "Failed to render markdown, falling back to plain text:",
         error,
       );
-      console.log("\n" + chalk.bgBlue.white(" 🤖 CHAVES ") + "\n");
-      console.log(chalk.white(summary));
+      const content = `${eventsBlock}${summary}`.trim();
+      this.pushMessage({
+        role: "assistant",
+        content,
+        timestamp: Date.now(),
+      });
     }
 
-    console.log(chalk.dim("─".repeat(50)) + "\n");
-
-    logger.debug("UI", "Summary displayed to console");
+    this.eventBuffer = [];
   }
 
   showWelcome(projectPath: string) {
-    logger.debug("UI", "Displaying welcome screen");
-    logger.debug("UI", `Project path: ${projectPath}`);
-
-    console.clear();
-    try {
-      const ascii = readFileSync(
-        new URL("../chaves-ascii", import.meta.url),
-        "utf8",
-      );
-      console.log(chalk.blue(ascii));
-    } catch (error) {
-      logger.warn(
-        "UI",
-        "Failed to load chaves-ascii, falling back to title only",
-        error,
-      );
-    }
-
-    console.log(chalk.dim(`  Project: ${projectPath}`));
-    console.log(chalk.dim("─".repeat(50)) + "\n");
-
-    logger.debug("UI", "Welcome screen displayed");
+    logger.debug("UI", "Displaying welcome message");
+    this.pushMessage({
+      role: "system",
+      content: `Watching project: ${projectPath}`,
+      timestamp: Date.now(),
+    });
   }
 
   showError(message: string, error?: Error) {
     logger.error("UI", `Displaying error: ${message}`);
-
-    console.error(chalk.red("\n❌ Error:"), message);
-
-    if (error) {
-      logger.debug("UI", `Error details: ${error.message}`);
-      console.error(chalk.dim(error.message));
-    }
-
-    console.log();
+    const details = error?.message ? `\n${error.message}` : "";
+    this.pushMessage({
+      role: "system",
+      content: `❌ ${message}${details}`,
+      timestamp: Date.now(),
+    });
   }
 
   showInfo(message: string) {
     logger.debug("UI", `Info: ${message}`);
-    console.log(chalk.blue("ℹ️ "), message);
+    this.pushMessage({
+      role: "system",
+      content: `ℹ️ ${message}`,
+      timestamp: Date.now(),
+    });
   }
 
   showSuccess(message: string) {
     logger.debug("UI", `Success: ${message}`);
-    console.log(chalk.green("✅"), message);
+    this.pushMessage({
+      role: "system",
+      content: `✅ ${message}`,
+      timestamp: Date.now(),
+    });
+  }
+
+  setStatus(text: string) {
+    this.chat.setStatus(text);
+  }
+
+  setWatching(active: boolean) {
+    if (active) {
+      this.chat.startWatchingIndicator();
+    } else {
+      this.chat.stopWatchingIndicator();
+    }
+  }
+
+  focusInput() {
+    this.chat.focusInput();
+  }
+
+  destroy() {
+    this.chat.destroy();
   }
 }

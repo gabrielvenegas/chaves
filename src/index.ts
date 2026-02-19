@@ -1,4 +1,3 @@
-import { createInterface } from "readline/promises";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { createHash } from "crypto";
@@ -68,18 +67,7 @@ async function main() {
     return;
   }
 
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  const answer = (
-    await rl.question(`Enter project path to watch (default: ${defaultPath}): `)
-  ).trim();
-
-  rl.close();
-
-  const projectPath = answer || defaultPath;
+  const projectPath = defaultPath;
 
   // Enable debug mode via environment variable (off by default)
   const DEBUG_MODE = process.env.CHAVES_DEBUG === "true";
@@ -114,10 +102,41 @@ async function main() {
 
   logger.debug("APP", `Last summarized event ID: ${lastSummarizedEventId}`);
 
+  let lastSummary = store.getLastSummary();
+
   ui.showWelcome(projectPath);
 
+  ui.onUserMessage(async (text) => {
+    ui.setWatching(false);
+    ui.setStatus("Thinking…");
+
+    const prompt = summarizer.buildChatPrompt(text, lastSummary?.content);
+    logger.aiRequest(prompt.length);
+
+    try {
+      const { text: reply } = await generateText({
+        model: diffClient(configuredModel),
+        maxTokens: 400,
+        prompt,
+      });
+
+      if (reply.trim().length === 0) {
+        throw new Error("Empty response returned from AI provider");
+      }
+
+      ui.showSummary(reply);
+      logger.aiResponse(reply.length);
+    } catch (err) {
+      logger.error("APP", "❌ Chat response failed:", err);
+      ui.showError("Chat response failed", err as Error);
+    } finally {
+      ui.setStatus("Watching…");
+      ui.setWatching(true);
+      ui.focusInput();
+    }
+  });
+
   // Show last summary if exists
-  let lastSummary = store.getLastSummary();
   if (lastSummary) {
     logger.debug("APP", "Found previous summary, displaying...");
     ui.showSummary(lastSummary.content);
@@ -247,6 +266,7 @@ async function main() {
       details: event.details,
     });
 
+    // Buffer event for chat context (no direct log output)
     ui.logEvent(saved);
 
     if (isCountableEventType(saved.event_type)) {
@@ -316,6 +336,7 @@ async function main() {
   process.on("SIGINT", () => {
     logger.appStop();
     watcher.stop();
+    ui.destroy();
     console.log("\n👋 Chaves offline");
     process.exit(0);
   });

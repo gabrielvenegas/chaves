@@ -52,7 +52,7 @@ export class Logger {
 
   private log(level: LogLevel, category: string, message: string, data?: any) {
     if (!this.enabled) return;
-    if (level === LogLevel.DEBUG && !this.debugMode) return;
+    if (!this.debugMode) return;
 
     const timestamp = this.formatTimestamp();
     const levelStr = this.formatLevel(level);
@@ -60,7 +60,11 @@ export class Logger {
 
     let output = `${timestamp} ${levelStr} ${categoryStr} ${message}`;
 
-    if (data !== undefined) {
+    if (level === LogLevel.INFO) {
+      output = `${timestamp} ${levelStr} ${message}`;
+    }
+
+    if (data !== undefined && level !== LogLevel.INFO) {
       if (typeof data === "object") {
         output += "\n" + chalk.dim(JSON.stringify(data, null, 2));
       } else {
