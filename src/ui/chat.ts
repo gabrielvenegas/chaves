@@ -134,12 +134,12 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     const timePrefix = time ? `{gray-fg}${time}{/gray-fg} ` : "";
     const safeContent = escapeTags(msg.content);
     if (msg.role === "user") {
-      return `${timePrefix}{white-fg}{bold}YOU:{/bold}{/white-fg} ${safeContent}`;
+      return `${timePrefix}{white-fg}{bold}YOU:{/bold}{/white-fg}\n${safeContent}\n`;
     }
     if (msg.role === "assistant") {
-      return `${timePrefix}{cyan-fg}{bold}CHAVES:{/bold}{/cyan-fg} ${safeContent}`;
+      return `${timePrefix}{cyan-fg}{bold}CHAVES:{/bold}{/cyan-fg}\n${safeContent}\n`;
     }
-    return `${timePrefix}{yellow-fg}{bold}SYSTEM:{/bold}{/yellow-fg} ${safeContent}`;
+    return `${timePrefix}{yellow-fg}{bold}SYSTEM:{/bold}{/yellow-fg}\n${safeContent}\n`;
   }
 
   function onSubmit(handler: (text: string) => void) {

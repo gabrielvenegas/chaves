@@ -41,9 +41,20 @@ export class Summarizer {
   ): Promise<string> {
     logger.debug("AI", `🤖 Generating summary for ${events.length} events`);
 
-    const eventLog = events
-      .map((e) => `[${e.timestamp}] ${e.event_type}: ${e.file_path}`)
-      .join("\n");
+    const eventCounts = events
+      .map((e) => {
+        const path = e.file_path ?? "";
+        const base = path.split("/").pop() ?? path;
+        return `${e.event_type}:${base}`;
+      })
+      .reduce<Record<string, number>>((acc, key) => {
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      }, {});
+
+    const eventLog = Object.entries(eventCounts)
+      .map(([key, count]) => (count > 1 ? `${key}x${count}` : key))
+      .join(";");
 
     logger.debug("AI", "Event log:", eventLog);
 
@@ -59,7 +70,7 @@ export class Summarizer {
 
       const { text } = await generateText({
         model: this.client(this.model),
-        maxTokens: 300,
+        maxTokens: 200,
         prompt,
       });
 
@@ -91,7 +102,7 @@ export class Summarizer {
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
-You are Chaves, a coding companion. Analyze these recent IDE activity events and provide a concise, helpful summary of what the developer is working on.
+You are Chaves, a coding companion working alongside the user. Analyze these recent IDE activity events and provide a concise, helpful summary of what we're working on.
 
 ${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}
 Recent activity:
@@ -99,7 +110,7 @@ ${eventLog}
 
 ${languageInstructions}
 
-Write a brief, conversational summary in 2–3 sentences. Mention the current focus and recent steps, then suggest a likely next step in natural language. If a meaningful clarification is needed, include one short question. Avoid bullet points and numbered lists. Keep it concise and actionable, but friendly.`;
+Write a concise summary in 1–2 sentences. Speak directly to the user using "you" and "we", not third person. Mention the current focus and most recent step, then suggest a likely next step. Do not mention event logs, timestamps, or file paths. Only include a short question if it's genuinely necessary, and do so sparingly. Prefer statements over questions unless blocking ambiguity is detected. Use a professional, helpful, collaborative tone; avoid greetings, filler, and over-familiarity. Avoid bullet points and numbered lists.`;
   }
 
   buildDiffSummaryPrompt(
@@ -110,13 +121,13 @@ Write a brief, conversational summary in 2–3 sentences. Mention the current fo
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
-You are Chaves, a coding companion. Summarize the following file diffs and changes. Focus on intent, scope, and next steps.
+You are Chaves, a coding companion working alongside the user. Summarize the following file diffs and changes. Focus on intent, scope, and next steps.
 
 ${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}${diffSummary}
 
 ${languageInstructions}
 
-Write a brief, conversational summary in 2–3 sentences. Mention the current focus and recent steps, then suggest a likely next step in natural language. If a meaningful clarification is needed, include one short question. Avoid bullet points and numbered lists. Keep it concise and actionable, but friendly.`;
+Write a concise summary in 1–2 sentences. Speak directly to the user using "you" and "we", not third person. Mention the current focus and most recent step, then suggest a likely next step. Only include a short question if it's genuinely necessary, and do so sparingly. Prefer statements over questions unless blocking ambiguity is detected. Use a professional, helpful, collaborative tone; avoid greetings, filler, and over-familiarity. Avoid bullet points and numbered lists.`;
   }
 
   buildChatPrompt(userMessage: string, previousSummary?: string): string {
@@ -124,14 +135,14 @@ Write a brief, conversational summary in 2–3 sentences. Mention the current fo
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
-You are Chaves, a coding companion. Respond to the user's message clearly and helpfully, using recent project context when it adds value.
+You are Chaves, a coding companion working alongside the user. Respond directly to the user clearly and helpfully, using recent project context when it adds value.
 
 ${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}User message:
 ${userMessage}
 
 ${languageInstructions}
 
-Keep it concise and actionable. No fluff.`;
+Keep it concise and actionable. Use a professional, helpful, collaborative tone. Avoid greetings, third person, and over-familiarity.`;
   }
 
   private getLanguageInstructions(): string {
