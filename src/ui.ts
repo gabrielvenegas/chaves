@@ -93,11 +93,11 @@ export class UI {
     logger.debug("UI", `Showing new summary (${summary.length} chars)`);
     this.lastSummary = summary;
 
-    const eventsBlock = this.renderEventsBlock();
+    // const eventsBlock = this.renderEventsBlock();
 
     try {
       const renderedSummary = await this.markdownRenderer.render(summary);
-      const content = `${eventsBlock}${renderedSummary}`.trim();
+      const content = `${renderedSummary}`.trim();
       if (content.length > 0) {
         this.pushMessage({
           role: "assistant",
@@ -111,7 +111,7 @@ export class UI {
         "Failed to render markdown, falling back to plain text:",
         error,
       );
-      const content = `${eventsBlock}${summary}`.trim();
+      const content = `${summary}`.trim();
       this.pushMessage({
         role: "assistant",
         content,
