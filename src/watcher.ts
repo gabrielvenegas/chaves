@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import { relative } from "path";
 import { logger } from "./logger.js";
 import { DiffTracker, type FileChange } from "./diff-tracker.js";
+import { shield } from "./shield.js";
 import type { EventType } from "./store.js";
 
 export interface WatcherEvent {
@@ -47,10 +48,14 @@ export class Watcher extends EventEmitter {
 
     this.watcher
       .on("add", (path) => {
-        void this.handleEvent("file_create", path);
+        if (!shield.isSensitiveFile(path)) {
+          void this.handleEvent("file_create", path);
+        }
       })
       .on("change", (path) => {
-        void this.handleEvent("file_change", path);
+        if (!shield.isSensitiveFile(path)) {
+          void this.handleEvent("file_change", path);
+        }
       })
       .on("unlink", (path) => {
         void this.handleEvent("file_delete", path);

@@ -90,6 +90,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     tags: true,
     keys: true,
     vi: true,
+    mouse: true,
+    alwaysScroll: true,
+    scrollable: true,
     scrollbar: {
       ch: " ",
       track: {
@@ -146,7 +149,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     submitHandler = handler;
   }
 
-  input.on("submit", (value) => {
+  input.on("submit", (value: string) => {
     const text = String(value ?? "").trim();
     input.clearValue();
     screen.render();
@@ -164,6 +167,40 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   screen.key(["C-c"], () => {
     screen.destroy();
     process.exit(0);
+  });
+
+  screen.key(["pageup"], () => {
+    transcript.scroll(
+      -Math.max(1, Math.floor((transcript.height as number) / 2)),
+    );
+    screen.render();
+  });
+
+  screen.key(["pagedown"], () => {
+    transcript.scroll(
+      Math.max(1, Math.floor((transcript.height as number) / 2)),
+    );
+    screen.render();
+  });
+
+  screen.key(["S-up"], () => {
+    transcript.scroll(-3);
+    screen.render();
+  });
+
+  screen.key(["S-down"], () => {
+    transcript.scroll(3);
+    screen.render();
+  });
+
+  transcript.on("wheelup", () => {
+    transcript.scroll(-3);
+    screen.render();
+  });
+
+  transcript.on("wheeldown", () => {
+    transcript.scroll(3);
+    screen.render();
   });
 
   function pushMessage(message: ChatMessage) {

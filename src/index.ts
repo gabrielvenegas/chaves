@@ -114,9 +114,9 @@ async function main() {
     logger.aiRequest(prompt.length);
 
     try {
-      const { text: reply } = await generateText({
+      const { text: reply, response } = await generateText({
         model: diffClient(configuredModel),
-        maxTokens: 400,
+        maxTokens: 3000,
         prompt,
       });
 

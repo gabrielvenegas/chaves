@@ -1,6 +1,7 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { logger } from "./logger.js";
+import { shield } from "./shield.js";
 import type { ActivityEvent } from "./store.js";
 
 export class Summarizer {
@@ -58,7 +59,8 @@ export class Summarizer {
 
     logger.debug("AI", "Event log:", eventLog);
 
-    const prompt = this.buildEventSummaryPrompt(eventLog, previousSummary);
+    let prompt = this.buildEventSummaryPrompt(eventLog, previousSummary);
+    prompt = shield.sanitize(prompt);
 
     logger.aiRequest(prompt.length);
     logger.debug("AI", `Prompt length: ${prompt.length} characters`);
@@ -99,12 +101,15 @@ export class Summarizer {
 
   buildEventSummaryPrompt(eventLog: string, previousSummary?: string): string {
     const languageInstructions = this.getLanguageInstructions();
+    const sanitizedPrevious = previousSummary
+      ? shield.sanitize(previousSummary)
+      : undefined;
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
 You are Chaves, a coding companion working alongside the user. Analyze these recent IDE activity events and provide a concise, helpful summary of what we're working on.
 
-${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}
+${sanitizedPrevious ? `Previous context:\n${sanitizedPrevious}\n\n` : ""}
 Recent activity:
 ${eventLog}
 
@@ -118,12 +123,16 @@ Write a concise summary in 1–2 sentences. Speak directly to the user using "yo
     previousSummary?: string,
   ): string {
     const languageInstructions = this.getLanguageInstructions();
+    const sanitizedPrevious = previousSummary
+      ? shield.sanitize(previousSummary)
+      : undefined;
+    const sanitizedDiff = shield.sanitize(diffSummary);
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
 You are Chaves, a coding companion working alongside the user. Summarize the following file diffs and changes. Focus on intent, scope, and next steps.
 
-${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}${diffSummary}
+${sanitizedPrevious ? `Previous context:\n${sanitizedPrevious}\n\n` : ""}${sanitizedDiff}
 
 ${languageInstructions}
 
@@ -132,13 +141,17 @@ Write a concise summary in 1–2 sentences. Speak directly to the user using "yo
 
   buildChatPrompt(userMessage: string, previousSummary?: string): string {
     const languageInstructions = this.getLanguageInstructions();
+    const sanitizedPrevious = previousSummary
+      ? shield.sanitize(previousSummary)
+      : undefined;
+    const sanitizedMessage = shield.sanitize(userMessage);
 
     return `LANGUAGE: You MUST respond in ${this.language === "pt" || this.language === "pt-BR" ? "português do Brasil" : this.language}. Do not use English or any other language.
 
 You are Chaves, a coding companion working alongside the user. Respond directly to the user clearly and helpfully, using recent project context when it adds value.
 
-${previousSummary ? `Previous context:\n${previousSummary}\n\n` : ""}User message:
-${userMessage}
+${sanitizedPrevious ? `Previous context:\n${sanitizedPrevious}\n\n` : ""}User message:
+${sanitizedMessage}
 
 ${languageInstructions}
 

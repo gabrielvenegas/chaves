@@ -3,6 +3,7 @@ import { createTwoFilesPatch } from "diff";
 import { relative } from "path";
 import type { EventType } from "./store.js";
 import { logger } from "./logger.js";
+import { shield } from "./shield.js";
 
 export interface FileChange {
   path: string;
@@ -11,7 +12,8 @@ export interface FileChange {
   after?: string;
   diff?: string;
   timestamp: number;
-  language?: string; // for syntax highlighting hints
+  language?: string;
+  blocked?: boolean;
 }
 
 export class DiffTracker {
@@ -50,6 +52,11 @@ export class DiffTracker {
     type: EventType,
     fullPath: string,
   ): Promise<FileChange | null> {
+    // Block sensitive files immediately
+    if (shield.isSensitiveFile(fullPath)) {
+      return null;
+    }
+
     // Skip binary files
     if (this.isBinary(fullPath)) {
       logger.debug("DIFF", `Skipping binary file: ${fullPath}`);
@@ -77,13 +84,19 @@ export class DiffTracker {
     const content = await this.readFileSafe(fullPath);
     if (content === null) return null;
 
-    this.cache.set(fullPath, content);
+    // Block if contains API keys
+    if (shield.hasApiKey(content)) {
+      return null;
+    }
+
+    const sanitized = shield.sanitize(content);
+    this.cache.set(fullPath, sanitized);
     const displayPath = this.normalizePath(fullPath);
 
     const change: FileChange = {
       path: displayPath,
       type: "added",
-      after: content,
+      after: sanitized,
       timestamp: Date.now(),
       language: this.detectLanguage(fullPath),
     };
@@ -97,7 +110,14 @@ export class DiffTracker {
     const newContent = await this.readFileSafe(fullPath);
 
     if (newContent === null) return null;
-    if (oldContent === newContent) return null; // No actual change
+
+    // Block if contains API keys
+    if (shield.hasApiKey(newContent)) {
+      return null;
+    }
+
+    const sanitized = shield.sanitize(newContent);
+    if (oldContent === sanitized) return null;
 
     const displayPath = this.normalizePath(fullPath);
 
@@ -106,18 +126,18 @@ export class DiffTracker {
       displayPath,
       displayPath,
       oldContent,
-      newContent,
+      sanitized,
       "before",
       "after",
     );
 
-    this.cache.set(fullPath, newContent);
+    this.cache.set(fullPath, sanitized);
 
     const change: FileChange = {
       path: displayPath,
       type: "modified",
       before: oldContent,
-      after: newContent,
+      after: sanitized,
       diff: this.simplifyDiff(diff),
       timestamp: Date.now(),
       language: this.detectLanguage(fullPath),
@@ -158,7 +178,7 @@ export class DiffTracker {
       const header = `### ${change.type.toUpperCase()}: ${change.path}${change.language ? ` (${change.language})` : ""}`;
 
       if (change.type === "added") {
-        return `${header}\n\`\`\`${change.language || "text"}\n${this.truncate(change.after, 100)}\n\`\`\``;
+        return `${header}\n\`\`\`${change.language || "text"}\n${this.truncate(change.after || "", 100)}\n\`\`\``;
       }
 
       if (change.type === "deleted") {
