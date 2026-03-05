@@ -101,7 +101,7 @@ export class Watcher extends EventEmitter {
     this.emit("event", { type, path, change } as WatcherEvent);
     logger.debug("WATCHER", `Emitted event: ${type} for ${path}`);
 
-    if (this.diffTracker.pendingCount > 10) {
+    if (this.diffTracker.pendingCount > 15) {
       this.triggerSummarization();
     }
   }

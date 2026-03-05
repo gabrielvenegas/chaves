@@ -1,5 +1,3 @@
-import { createOpenAI } from "@ai-sdk/openai";
-import { generateText } from "ai";
 import { createHash } from "crypto";
 import { logger } from "./logger.js";
 import { Store, type ActivityEvent } from "./store.js";
@@ -30,102 +28,62 @@ function isCountableEvent(event: ActivityEvent): boolean {
   return isCountableEventType(event.event_type);
 }
 
-function buildEventLog(events: ActivityEvent[]): string {
-  return events
-    .map((e) => `[${e.timestamp}] ${e.event_type}: ${e.file_path}`)
-    .join("\n");
-}
-
 function getUniqueFileCount(events: ActivityEvent[]): number {
-  const unique = new Set(
-    events.map((event) => event.file_path).filter(Boolean),
-  );
-  return unique.size;
+  return new Set(events.map((e) => e.file_path).filter(Boolean)).size;
 }
 
-function hashPrompt(prompt: string): string {
-  return createHash("sha256").update(prompt).digest("hex");
+function hashString(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function main() {
-  const defaultPath = process.argv[2] || process.cwd();
+  const args = process.argv.slice(2);
+  const setupFlagIndex = ["--setup", "setup"]
+    .map((f) => args.indexOf(f))
+    .find((i) => i !== -1);
 
-  // Check for setup command
-  if (process.argv.includes("--setup") || process.argv.includes("setup")) {
-    // Find the path argument after setup
-    const setupIndex = process.argv.indexOf("--setup");
-    const setupIndex2 = process.argv.indexOf("setup");
-    const setupArgIndex = setupIndex !== -1 ? setupIndex : setupIndex2;
-
-    let setupPath = process.cwd();
-    // If there's an argument after setup, use it as the path
-    if (setupArgIndex !== -1 && process.argv[setupArgIndex + 1]) {
-      setupPath = process.argv[setupArgIndex + 1];
-    }
-
+  if (setupFlagIndex !== undefined) {
+    const setupPath = args[setupFlagIndex + 1] ?? process.cwd();
     await runSetup(setupPath);
     return;
   }
 
-  const projectPath = defaultPath;
-
-  // Enable debug mode via environment variable (off by default)
+  const projectPath = args[0] ?? process.cwd();
   const DEBUG_MODE = process.env.CHAVES_DEBUG === "true";
+
   logger.setDebugMode(DEBUG_MODE);
-
-  if (DEBUG_MODE) {
-    logger.info("CONFIG", "🐛 Debug mode ENABLED");
-  } else {
-    logger.debug(
-      "CONFIG",
-      "Debug mode disabled (set CHAVES_DEBUG=true to enable)",
-    );
-  }
-
+  logger.info(
+    "CONFIG",
+    DEBUG_MODE ? "🐛 Debug mode ENABLED" : "Debug mode disabled",
+  );
   logger.appStart(projectPath);
 
   const store = new Store(projectPath);
-  const configuredModel = store.getModel();
-  const configuredLanguage = store.getLanguage();
+  const summarizer = new Summarizer(store.getModel(), store.getLanguage());
   const watcher = new Watcher(projectPath);
-  const summarizer = new Summarizer(configuredModel, configuredLanguage);
-  const diffClient = createOpenAI({
-    baseURL: "https://openrouter.ai/api/v1",
-    apiKey: process.env.OPENROUTER_API_KEY,
-  });
   const ui = new UI();
 
   let eventsSinceLastSummary = 0;
   let lastSummarizedEventId = store.getLastSummary()?.event_range_end ?? 0;
   let isSummarizing = false;
   let lastEventSummaryPromptHash: string | null = null;
+  let lastSummary = store.getLastSummary();
 
   logger.debug("APP", `Last summarized event ID: ${lastSummarizedEventId}`);
 
-  let lastSummary = store.getLastSummary();
-
   ui.showWelcome(projectPath);
+
+  if (lastSummary) {
+    ui.showSummary(lastSummary.content);
+  }
 
   ui.onUserMessage(async (text) => {
     ui.setWatching(false);
     ui.setStatus("Thinking…");
 
-    const prompt = summarizer.buildChatPrompt(text, lastSummary?.content);
-    logger.aiRequest(prompt.length);
-
     try {
-      const { text: reply, response } = await generateText({
-        model: diffClient(configuredModel),
-        maxTokens: 3000,
-        prompt,
-      });
-
-      if (reply.trim().length === 0) {
-        throw new Error("Empty response returned from AI provider");
-      }
-
+      const reply = await summarizer.generateChat(text, lastSummary?.content);
       ui.showSummary(reply);
-      logger.aiResponse(reply.length);
     } catch (err) {
       logger.error("APP", "❌ Chat response failed:", err);
       ui.showError("Chat response failed", err as Error);
@@ -136,18 +94,8 @@ async function main() {
     }
   });
 
-  // Show last summary if exists
-  if (lastSummary) {
-    logger.debug("APP", "Found previous summary, displaying...");
-    ui.showSummary(lastSummary.content);
-  } else {
-    logger.debug("APP", "No previous summary found");
-  }
-
   async function runSummaryIfNeeded() {
-    if (isSummarizing || eventsSinceLastSummary < SUMMARY_THRESHOLD) {
-      return;
-    }
+    if (isSummarizing || eventsSinceLastSummary < SUMMARY_THRESHOLD) return;
 
     isSummarizing = true;
     logger.info("APP", "📊 Summary threshold reached, generating summary...");
@@ -156,13 +104,9 @@ async function main() {
       const newEvents = store.getEventsSince(lastSummarizedEventId);
       const countableEvents = newEvents.filter(isCountableEvent);
 
-      logger.debug(
-        "APP",
-        `Fetched ${newEvents.length} new events for summary`,
-        {
-          countableEvents: countableEvents.length,
-        },
-      );
+      logger.debug("APP", `Fetched ${newEvents.length} new events`, {
+        countableEvents: countableEvents.length,
+      });
 
       if (countableEvents.length === 0) {
         logger.warn("APP", "No countable events to summarize (unexpected)");
@@ -176,13 +120,6 @@ async function main() {
       }
 
       const uniqueFileCount = getUniqueFileCount(countableEvents);
-      const eventLog = buildEventLog(countableEvents);
-      const prompt = summarizer.buildEventSummaryPrompt(
-        eventLog,
-        lastSummary?.content,
-      );
-      const promptHash = hashPrompt(prompt);
-
       const isMeaningful =
         countableEvents.length >= SUMMARY_MIN_COUNTABLE_EVENTS ||
         uniqueFileCount >= SUMMARY_MIN_UNIQUE_FILES;
@@ -200,6 +137,15 @@ async function main() {
         return;
       }
 
+      const promptHash = hashString(
+        summarizer.buildEventSummaryPrompt(
+          countableEvents
+            .map((e) => `[${e.timestamp}] ${e.event_type}: ${e.file_path}`)
+            .join("\n"),
+          lastSummary?.content,
+        ),
+      );
+
       if (lastEventSummaryPromptHash === promptHash) {
         logger.info("APP", "⏭️  Summary skipped (prompt unchanged)");
         lastSummarizedEventId = lastEventId;
@@ -207,41 +153,29 @@ async function main() {
       }
 
       const startTime = Date.now();
-
       const summary = await summarizer.generateSummary(
         countableEvents,
         lastSummary?.content,
       );
 
       lastEventSummaryPromptHash = promptHash;
-
-      logger.debug("APP", `Last event ID in batch: ${lastEventId}`);
-
       store.saveSummary(summary, lastSummarizedEventId, lastEventId);
-
       lastSummarizedEventId = lastEventId;
       lastSummary = { content: summary, event_range_end: lastEventId };
       ui.showSummary(summary);
 
-      const duration = Date.now() - startTime;
-      logger.info(
-        "APP",
-        `✅ Summary generation complete (${duration}ms total)`,
-      );
+      logger.info("APP", `✅ Summary done (${Date.now() - startTime}ms)`);
     } catch (err) {
       logger.error("APP", "❌ Summary generation failed:", err);
-
       if (err instanceof Error) {
         logger.error("APP", `Error details: ${err.message}`);
-        logger.debug("APP", `Error stack:`, err.stack);
+        logger.debug("APP", "Error stack:", err.stack);
       }
-
-      // Show error in UI
-      console.error("Summary generation failed:", err);
     } finally {
       isSummarizing = false;
-      const pendingEvents = store.getEventsSince(lastSummarizedEventId);
-      eventsSinceLastSummary = pendingEvents.filter(isCountableEvent).length;
+      eventsSinceLastSummary = store
+        .getEventsSince(lastSummarizedEventId)
+        .filter(isCountableEvent).length;
 
       logger.debug(
         "APP",
@@ -255,7 +189,7 @@ async function main() {
   }
 
   watcher.on("event", async (event) => {
-    logger.debug("APP", `📨 Received event: ${event.type}`, {
+    logger.debug("APP", `📨 Event: ${event.type}`, {
       path: event.path,
       details: event.details,
     });
@@ -266,7 +200,6 @@ async function main() {
       details: event.details,
     });
 
-    // Buffer event for chat context (no direct log output)
     ui.logEvent(saved);
 
     if (isCountableEventType(saved.event_type)) {
@@ -282,56 +215,38 @@ async function main() {
   });
 
   watcher.on("summarize", async (payload) => {
-    logger.debug("APP", "📨 Received summarize event", {
+    logger.debug("APP", "📨 Summarize event", {
       changeCount: payload.changes.length,
     });
 
-    if (!payload.prompt) {
-      return;
-    }
+    if (!payload.prompt) return;
 
     try {
-      const prompt = summarizer.buildDiffSummaryPrompt(
-        payload.prompt,
-        lastSummary?.content,
-      );
-
-      const changesJson = JSON.stringify(payload.changes);
       store.saveDiffSnapshot(
         payload.prompt,
-        changesJson,
+        JSON.stringify(payload.changes),
         payload.changes.length,
       );
 
-      logger.aiRequest(prompt.length);
-
-      const { text } = await generateText({
-        model: diffClient(configuredModel),
-        maxTokens: 300,
-        prompt,
-      });
-
-      if (text.trim().length === 0) {
-        throw new Error("Empty summary returned from AI provider");
-      }
+      const text = await summarizer.generateDiff(
+        payload.prompt,
+        lastSummary?.content,
+      );
 
       store.saveSummary(text, lastSummarizedEventId, lastSummarizedEventId);
       lastSummary = { content: text, event_range_end: lastSummarizedEventId };
       ui.showSummary(text);
     } catch (err) {
-      logger.error("APP", "❌ Diff summary generation failed:", err);
-
+      logger.error("APP", "❌ Diff summary failed:", err);
       if (err instanceof Error) {
         logger.error("APP", `Error details: ${err.message}`);
-        logger.debug("APP", `Error stack:`, err.stack);
+        logger.debug("APP", "Error stack:", err.stack);
       }
-
-      console.error("Diff summary generation failed:", err);
     }
   });
 
   watcher.start();
-  logger.info("APP", "⚡ CHAVES is now running and listening for events");
+  logger.info("APP", "⚡ CHAVES is now running");
 
   process.on("SIGINT", () => {
     logger.appStop();
@@ -341,21 +256,16 @@ async function main() {
     process.exit(0);
   });
 
-  // Handle uncaught errors
   process.on("uncaughtException", (error) => {
     logger.error("APP", "❌ Uncaught exception:", error);
-    console.error("Uncaught exception:", error);
   });
 
   process.on("unhandledRejection", (reason, promise) => {
-    logger.error("APP", "❌ Unhandled rejection at:", promise);
-    logger.error("APP", "Reason:", reason);
-    console.error("Unhandled rejection:", reason);
+    logger.error("APP", "❌ Unhandled rejection at:", reason);
   });
 }
 
 main().catch((error) => {
-  logger.error("APP", "❌ Failed to start application:", error);
-  console.error("Failed to start application:", error);
+  logger.error("APP", "❌ Failed to start:", error);
   process.exit(1);
 });
