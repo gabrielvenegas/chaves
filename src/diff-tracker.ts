@@ -4,6 +4,7 @@ import { relative } from "path";
 import type { EventType } from "./store.js";
 import { logger } from "./logger.js";
 import { shield } from "./shield.js";
+import { detectLanguage, isBinaryPath } from "./file-rules.js";
 
 export interface FileChange {
   path: string;
@@ -22,26 +23,6 @@ export class DiffTracker {
   private cache = new Map<string, string>(); // path -> content
   private pending: FileChange[] = [];
   private readonly maxFileSize = 1024 * 1024; // 1MB limit
-  private binaryExtensions = new Set([
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".ico",
-    ".pdf",
-    ".exe",
-    ".dll",
-    ".so",
-    ".dylib",
-    ".zip",
-    ".tar",
-    ".gz",
-    ".mp3",
-    ".mp4",
-    ".mov",
-    ".woff",
-    ".woff2",
-  ]);
 
   private normalizePath(fullPath: string): string {
     if (!this.projectPath) return fullPath;
@@ -58,7 +39,7 @@ export class DiffTracker {
     }
 
     // Skip binary files
-    if (this.isBinary(fullPath)) {
+    if (isBinaryPath(fullPath)) {
       logger.debug("DIFF", `Skipping binary file: ${fullPath}`);
       return null;
     }
@@ -83,22 +64,28 @@ export class DiffTracker {
   private async handleCreate(fullPath: string): Promise<FileChange | null> {
     const content = await this.readFileSafe(fullPath);
     if (content === null) return null;
+    const displayPath = this.normalizePath(fullPath);
 
-    // Block if contains API keys
     if (shield.hasApiKey(content)) {
-      return null;
+      return {
+        path: displayPath,
+        type: "added",
+        after: "",
+        timestamp: Date.now(),
+        language: detectLanguage(fullPath),
+        blocked: true,
+      };
     }
 
     const sanitized = shield.sanitize(content);
     this.cache.set(fullPath, sanitized);
-    const displayPath = this.normalizePath(fullPath);
 
     const change: FileChange = {
       path: displayPath,
       type: "added",
       after: sanitized,
       timestamp: Date.now(),
-      language: this.detectLanguage(fullPath),
+      language: detectLanguage(fullPath),
     };
 
     this.pending.push(change);
@@ -110,16 +97,22 @@ export class DiffTracker {
     const newContent = await this.readFileSafe(fullPath);
 
     if (newContent === null) return null;
+    const displayPath = this.normalizePath(fullPath);
 
-    // Block if contains API keys
     if (shield.hasApiKey(newContent)) {
-      return null;
+      this.cache.delete(fullPath);
+      return {
+        path: displayPath,
+        type: "modified",
+        after: "",
+        timestamp: Date.now(),
+        language: detectLanguage(fullPath),
+        blocked: true,
+      };
     }
 
     const sanitized = shield.sanitize(newContent);
     if (oldContent === sanitized) return null;
-
-    const displayPath = this.normalizePath(fullPath);
 
     // Generate unified diff
     const diff = createTwoFilesPatch(
@@ -140,7 +133,7 @@ export class DiffTracker {
       after: sanitized,
       diff: this.simplifyDiff(diff),
       timestamp: Date.now(),
-      language: this.detectLanguage(fullPath),
+      language: detectLanguage(fullPath),
     };
 
     this.pending.push(change);
@@ -203,30 +196,6 @@ export class DiffTracker {
     } catch {
       return null;
     }
-  }
-
-  private isBinary(path: string): boolean {
-    const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
-    return this.binaryExtensions.has(ext);
-  }
-
-  private detectLanguage(path: string): string {
-    const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
-    const map: Record<string, string> = {
-      ".ts": "typescript",
-      ".js": "javascript",
-      ".tsx": "tsx",
-      ".jsx": "jsx",
-      ".json": "json",
-      ".md": "markdown",
-      ".css": "css",
-      ".scss": "scss",
-      ".html": "html",
-      ".py": "python",
-      ".rs": "rust",
-      ".go": "go",
-    };
-    return map[ext] || "text";
   }
 
   private simplifyDiff(fullDiff: string): string {

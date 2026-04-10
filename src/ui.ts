@@ -1,6 +1,7 @@
 import { MarkdownRenderer } from "./markdown/renderer.js";
+import { CHAT_COMMANDS, PRIMARY_CHAT_COMMANDS } from "./chatCommands.js";
 import { logger } from "./logger.js";
-import type { ActivityEvent } from "./store.js";
+import type { ActivityEvent, TerminalEventRecord } from "./store.js";
 import { createChatUI, type ChatMessage, type ChatUI } from "./ui/chat.js";
 
 type UserMessageHandler = (text: string) => Promise<void> | void;
@@ -13,12 +14,16 @@ export class UI {
   private readonly maxEventBuffer = 8;
   private userHandler: UserMessageHandler | null = null;
 
-  constructor() {
+  constructor({ showPaneToggleHint = false }: { showPaneToggleHint?: boolean } = {}) {
     logger.debug("UI", "UI component initialized (blessed chat)");
     this.markdownRenderer = new MarkdownRenderer();
     this.chat = createChatUI({
       title: "CHAVES",
       initialStatus: "Watching…",
+      commandHints: showPaneToggleHint
+        ? [...PRIMARY_CHAT_COMMANDS, "Ctrl+L: switch pane"]
+        : PRIMARY_CHAT_COMMANDS,
+      commands: CHAT_COMMANDS,
     });
     this.chat.startWatchingIndicator();
   }
@@ -41,6 +46,10 @@ export class UI {
         logger.error("UI", "User handler failed", message);
       }
     });
+  }
+
+  logTerminalEvent(event: TerminalEventRecord) {
+    this.chat.pushLog(event.stream, event.data);
   }
 
   logEvent(event: ActivityEvent) {
@@ -84,24 +93,14 @@ export class UI {
     this.chat.pushMessage(message);
   }
 
-  async showSummary(summary: string) {
-    if (summary === this.lastSummary) {
-      logger.debug("UI", "Summary unchanged, skipping display");
-      return;
-    }
-
-    logger.debug("UI", `Showing new summary (${summary.length} chars)`);
-    this.lastSummary = summary;
-
-    // const eventsBlock = this.renderEventsBlock();
-
+  async showAssistantMessage(content: string) {
     try {
-      const renderedSummary = await this.markdownRenderer.render(summary);
-      const content = `${renderedSummary}`.trim();
-      if (content.length > 0) {
+      const rendered = await this.markdownRenderer.render(content);
+      const formatted = `${rendered}`.trim();
+      if (formatted.length > 0) {
         this.pushMessage({
           role: "assistant",
-          content,
+          content: formatted,
           timestamp: Date.now(),
         });
       }
@@ -111,13 +110,24 @@ export class UI {
         "Failed to render markdown, falling back to plain text:",
         error,
       );
-      const content = `${summary}`.trim();
       this.pushMessage({
         role: "assistant",
-        content,
+        content: `${content}`.trim(),
         timestamp: Date.now(),
       });
     }
+  }
+
+  async showSummary(summary: string) {
+    if (summary === this.lastSummary) {
+      logger.debug("UI", "Summary unchanged, skipping display");
+      return;
+    }
+
+    logger.debug("UI", `Showing new summary (${summary.length} chars)`);
+    this.lastSummary = summary;
+
+    await this.showAssistantMessage(summary);
 
     this.eventBuffer = [];
   }
@@ -173,6 +183,12 @@ export class UI {
 
   focusInput() {
     this.chat.focusInput();
+  }
+
+  clearContext() {
+    this.lastSummary = "";
+    this.eventBuffer = [];
+    this.chat.clearMessages();
   }
 
   destroy() {

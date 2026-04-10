@@ -7,6 +7,9 @@ CHAVES is an intelligent coding companion that watches your IDE activity, tracks
 - 📁 **File System Monitoring**: Tracks file creates, changes, and deletions
 - 🤖 **AI Summaries**: Generates contextual summaries of your coding activity
 - 💾 **Persistent Storage**: SQLite database for event history
+- 🧠 **Persistent Chat Memory**: Keeps user/assistant history across restarts
+- 🔎 **DB-Backed Code Search**: Indexes project files for chat-time retrieval
+- 🛠️ **Interactive Commands**: Query saved history/events/diffs from chat
 - 🎨 **Beautiful CLI**: Clean terminal UI with colored output
 - 🐛 **Comprehensive Logging**: Detailed debug logs for troubleshooting
 - 📝 **Markdown Rendering**: Beautiful markdown display using Glow (system dependency)
@@ -40,6 +43,40 @@ bun run start [project-path]
 
 If no path is provided, CHAVES will watch the current directory.
 
+### Onboarding (First Run)
+
+On first run per project, CHAVES starts a short onboarding wizard (saved to that project's `.chaves.db`) that configures:
+
+- Inference mode: Managed inference or BYOK (Bring Your Own Key)
+- Model and language
+- Message frequency (verbosity + how often proactive updates fire)
+- Personality (tone)
+
+Notes:
+
+- Managed inference currently uses the global `OPENROUTER_API_KEY` from your environment.
+- BYOK stores an OpenRouter API key in plaintext in `.chaves.db`. Do not commit or share `.chaves.db`.
+
+To force rerunning onboarding:
+
+```bash
+bun run start --onboarding [project-path]
+```
+
+### Chat Commands
+
+You can query stored context directly from chat input:
+
+- `/help`
+- `/setup`
+- `/model`
+- `/model list`
+- `/model set <id|number>`
+- `/history [n]`
+- `/events [n]`
+- `/diffs [n]`
+- `/diff <id>`
+
 ### Configure AI Model and Language
 
 CHAVES uses OpenRouter to access various AI models and supports multiple languages for summaries. By default, it uses Claude 3.5 Haiku and English, but you can customize both:
@@ -62,7 +99,20 @@ Or directly using the script:
 
 This command will start an interactive wizard that lets you:
 
-1. **Select a response language**:
+1. **Choose from popular models**:
+   - Claude 3.5 Haiku (fast and efficient) ⭐ Default
+   - Claude 3 Opus (most capable)
+   - Claude 3 Sonnet (balanced)
+   - GPT-4 Turbo
+   - GPT-4
+   - GPT-3.5 Turbo
+   - Llama 2 70B
+   - Mistral Large
+   - And more...
+
+2. **Enter a custom model ID** if you want to use a model not in the list
+
+3. **Select a response language**:
    - English (en)
    - Spanish (es)
    - French (fr)
@@ -74,19 +124,6 @@ This command will start an interactive wizard that lets you:
    - Korean (ko)
    - Chinese (zh)
 
-2. **Choose from popular models**:
-   - Claude 3.5 Haiku (fast and efficient) ⭐ Default
-   - Claude 3 Opus (most capable)
-   - Claude 3 Sonnet (balanced)
-   - GPT-4 Turbo
-   - GPT-4
-   - GPT-3.5 Turbo
-   - Llama 2 70B
-   - Mistral Large
-   - And more...
-
-3. **Enter a custom model ID** if you want to use a model not in the list
-
 The setup configuration is saved to the specified project's `.chaves.db` file.
 
 Once selected, your choices are saved to the project database and will be used for all future summaries. You can run the setup wizard again anytime to change the model or language.
@@ -94,27 +131,6 @@ Once selected, your choices are saved to the project database and will be used f
 **Example Output**:
 
 ```
-🌐 Starting language selection...
-
-📋 Available Languages:
-
-1. English (en)
-2. Spanish (es)
-3. French (fr)
-4. German (de)
-5. Italian (it)
-6. Portuguese (pt)
-7. Russian (ru)
-8. Japanese (ja)
-9. Korean (ko)
-10. Chinese (zh)
-
-11. Cancel setup
-
-Select a language (enter number): 1
-
-✅ Selected: English (en)
-
 🎯 Starting model selection...
 
 📋 Available OpenRouter Models:
@@ -129,6 +145,19 @@ Select a model (enter number): 1
 
 ✅ Selected: Claude 3.5 Haiku (anthropic/claude-3.5-haiku)
 
+🌐 Starting language selection...
+
+📋 Available Languages:
+
+1. English (en)
+2. Spanish (es)
+3. French (fr)
+...
+
+Select a language (enter number): 1
+
+✅ Selected: English (en)
+
 ✨ Setup complete! Using model: anthropic/claude-3.5-haiku and language: en
 ```
 
@@ -140,9 +169,9 @@ bun run dev
 
 This runs CHAVES with hot-reload enabled.
 
-### Configure AI Model
+### Configure Model and Language
 
-CHAVES uses OpenRouter to access various AI models. By default, it uses Claude 3.5 Haiku, but you can choose from many other models:
+CHAVES uses OpenRouter to access various AI models and supports response language selection:
 
 ```bash
 bun run setup
@@ -210,6 +239,10 @@ Get your API key at [OpenRouter](https://openrouter.ai/)
 ### Optional
 
 - `CHAVES_DEBUG`: Set to `"true"` to enable debug logs (default: `"false"`)
+- `CHAVES_INDEX_ON_START`: Enable startup indexing (default: `"true"`)
+- `CHAVES_INDEX_MAX_FILE_SIZE`: Max indexed file size in bytes (default: `1048576`)
+- `CHAVES_CHAT_CONTEXT_MESSAGES`: Recent chat messages injected into prompts (default: `20`)
+- `CHAVES_CHAT_SUMMARY_THRESHOLD`: New chat messages before rolling chat summary updates (default: `40`)
 
 Example:
 
@@ -375,10 +408,13 @@ chaves/
 ├── src/
 │   ├── index.ts          # Entry point and main loop
 │   ├── watcher.ts        # File system observer (chokidar)
-│   ├── store.ts          # Event storage (SQLite)
-│   ├── summarizer.ts     # AI summary generation (OpenRouter)
-│   ├── ui.ts             # Terminal display (chalk)
+│   ├── store.ts          # Persistent memory + project DB (SQLite)
+│   ├── indexer.ts        # Startup codebase indexing into DB
+│   ├── chaves-tools.ts   # Tool-calling surface for DB queries
+│   ├── summarizer.ts     # AI chat/summaries (OpenRouter)
+│   ├── ui.ts             # Terminal chat UI
 │   ├── logger.ts         # Logging utility
+│   ├── file-rules.ts     # Shared ignore/binary/language rules
 │   └── markdown/         # Markdown rendering
 │       └── renderer.ts  # Glow-based markdown renderer
 └── .chaves.db            # SQLite database (auto-created)
@@ -389,10 +425,11 @@ chaves/
 ### Event Flow
 
 1. **Watcher** detects file system changes via chokidar
-2. **Store** persists events to SQLite database
-3. **Summarizer** generates AI summaries every N events
-4. **UI** displays events and summaries to the user
-5. **Logger** tracks all operations for debugging
+2. **Store** persists events, diffs, messages, and indexed code to SQLite
+3. **Indexer** builds/updates a searchable code snapshot in `.chaves.db`
+4. **Summarizer** generates proactive summaries and tool-enabled chat replies
+5. **UI** displays chat, status, and command output to the user
+6. **Logger** tracks operations for debugging
 
 ### Idle Detection
 

@@ -4,6 +4,6 @@ todo
 [ ] - stripe setup
 [ ] - bundle and distribution
 [ ] - improve prompt
-[ ] - sqlite mcp ???
-[ ] - onboarding
+[ x ] - sqlite mcp
+[ x ] - onboarding
 [ ] - shortcuts

@@ -5,6 +5,7 @@ import { logger } from "./logger.js";
 import { DiffTracker, type FileChange } from "./diff-tracker.js";
 import { shield } from "./shield.js";
 import type { EventType } from "./store.js";
+import { WATCHER_IGNORED_PATTERNS } from "./file-rules.js";
 
 export interface WatcherEvent {
   type: EventType;
@@ -27,7 +28,7 @@ export class Watcher extends EventEmitter {
   }
 
   start() {
-    const ignored = [/node_modules/, /\.git/, /\.chaves\.db/, /dist/, /\.next/];
+    const ignored = WATCHER_IGNORED_PATTERNS;
 
     logger.watcherStart(this.projectPath);
     logger.debug(

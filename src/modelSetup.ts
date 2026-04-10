@@ -1,6 +1,9 @@
-import { createInterface } from "readline/promises";
+import type { createInterface } from "readline/promises";
+import chalk from "chalk";
 import { logger } from "./logger.js";
 import type { Store } from "./store.js";
+
+type Readline = ReturnType<typeof createInterface>;
 
 interface Model {
   id: string;
@@ -13,8 +16,15 @@ interface Language {
   name: string;
 }
 
-// Popular models from OpenRouter
-const POPULAR_MODELS: Model[] = [
+const theme = {
+  accent: chalk.hex("#f4bc69"),
+  text: chalk.hex("#f2dfc3"),
+  muted: chalk.hex("#ab9784"),
+  success: chalk.hex("#c8d35a"),
+  danger: chalk.hex("#f56565"),
+};
+
+export const POPULAR_MODELS: Model[] = [
   {
     id: "anthropic/claude-3.5-haiku",
     name: "Claude 3.5 Haiku",
@@ -57,7 +67,6 @@ const POPULAR_MODELS: Model[] = [
   },
 ];
 
-// Supported languages
 const SUPPORTED_LANGUAGES: Language[] = [
   { code: "en", name: "English" },
   { code: "es", name: "Spanish" },
@@ -73,160 +82,162 @@ const SUPPORTED_LANGUAGES: Language[] = [
 ];
 
 export class ModelSetup {
-  private rl: ReturnType<typeof createInterface>;
-  private selectedLanguage: string = "en";
+  private selectedLanguage = "en";
 
-  constructor() {
-    this.rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
+  getSelectedLanguage(): string {
+    return this.selectedLanguage;
+  }
+
+  async selectModel(
+    rl: Readline,
+    options: { defaultModelId?: string } = {},
+  ): Promise<string | null> {
+    logger.info("MODEL_SETUP", "Starting model selection...");
+
+    const defaultIndex = Math.max(
+      1,
+      POPULAR_MODELS.findIndex((model) => model.id === options.defaultModelId) +
+        1 || 1,
+    );
+
+    console.log(theme.text("Available OpenRouter models:\n"));
+
+    POPULAR_MODELS.forEach((model, index) => {
+      const num = index + 1;
+      const badges = [
+        model.id === options.defaultModelId ? theme.success("current") : "",
+      ].filter(Boolean).join(theme.muted(" • "));
+      const suffix = badges ? ` ${theme.muted(`[${badges}]`)}` : "";
+
+      console.log(`${theme.accent(`${num}.`)} ${theme.text(model.name)}${suffix}`);
+      console.log(`   ${theme.muted(model.id)}`);
+      if (model.description) {
+        console.log(`   ${theme.muted(model.description)}`);
+      }
     });
-  }
 
-  async selectLanguage(): Promise<string> {
-    logger.info("MODEL_SETUP", "🌐 Starting language selection...");
+    console.log(
+      `\n${theme.accent(`${POPULAR_MODELS.length + 1}.`)} ${theme.text("Enter custom model ID")}`,
+    );
+    console.log(
+      `${theme.accent(`${POPULAR_MODELS.length + 2}.`)} ${theme.text("Cancel")}\n`,
+    );
 
-    try {
-      console.log("\n📋 Available Languages:\n");
+    const choice = await rl.question(
+      `${theme.accent("Select a model")}${theme.muted(` [${defaultIndex}]`)}: `,
+    );
+    const selection = Number.parseInt(choice.trim() || String(defaultIndex), 10);
 
-      SUPPORTED_LANGUAGES.forEach((lang, index) => {
-        const num = index + 1;
-        console.log(`${num}. ${lang.name} (${lang.code})`);
-      });
+    if (
+      !Number.isFinite(selection) ||
+      selection < 1 ||
+      selection > POPULAR_MODELS.length + 2
+    ) {
+      console.log(theme.danger("Invalid selection. Please try again.\n"));
+      return this.selectModel(rl, options);
+    }
 
-      console.log(`\n${SUPPORTED_LANGUAGES.length + 1}. Cancel setup\n`);
+    if (selection === POPULAR_MODELS.length + 2) {
+      logger.info("MODEL_SETUP", "Model selection cancelled by user");
+      return null;
+    }
 
-      const choice = await this.rl.question(
-        "Select a language (enter number): ",
+    if (selection === POPULAR_MODELS.length + 1) {
+      const customModel = await rl.question(
+        `${theme.accent("Enter model ID")}${
+          options.defaultModelId
+            ? theme.muted(` [${options.defaultModelId}]`)
+            : ""
+        }: `,
       );
-      const selection = parseInt(choice.trim(), 10);
-
-      if (
-        selection < 1 ||
-        selection > SUPPORTED_LANGUAGES.length + 1 ||
-        isNaN(selection)
-      ) {
-        logger.warn("MODEL_SETUP", "Invalid selection");
-        console.log("❌ Invalid selection. Please try again.\n");
-        return this.selectLanguage();
+      const modelId = customModel.trim();
+      if (!modelId && options.defaultModelId) {
+        logger.info("MODEL_SETUP", `Keeping current model: ${options.defaultModelId}`);
+        return options.defaultModelId;
       }
 
-      if (selection === SUPPORTED_LANGUAGES.length + 1) {
-        logger.info("MODEL_SETUP", "Setup cancelled by user");
-        console.log("Setup cancelled.\n");
-        this.rl.close();
-        return "";
+      if (!modelId) {
+        console.log(theme.danger("Model ID cannot be empty.\n"));
+        return this.selectModel(rl, options);
       }
-
-      if (selection >= 1 && selection <= SUPPORTED_LANGUAGES.length) {
-        const selectedLanguage = SUPPORTED_LANGUAGES[selection - 1]!;
-        this.selectedLanguage = selectedLanguage.code;
-        logger.info(
-          "MODEL_SETUP",
-          `Language selected: ${selectedLanguage.name} (${selectedLanguage.code})`,
-        );
-        console.log(
-          `\n✅ Selected: ${selectedLanguage.name} (${selectedLanguage.code})\n`,
-        );
-
-        return selectedLanguage.code;
-      }
-
-      logger.warn("MODEL_SETUP", "Invalid language selection");
-      console.log("❌ Invalid selection. Please try again.\n");
-      return this.selectLanguage();
-    } catch (error) {
-      logger.error("MODEL_SETUP", "Error during language selection:", error);
-      this.rl.close();
-      throw error;
+      logger.info("MODEL_SETUP", `Custom model selected: ${modelId}`);
+      return modelId;
     }
+
+    const selectedModel = POPULAR_MODELS[selection - 1]!;
+    console.log(
+      `\n${theme.success("Selected")}: ${theme.text(selectedModel.name)} ${theme.muted(`(${selectedModel.id})`)}\n`,
+    );
+    logger.info("MODEL_SETUP", `Model selected: ${selectedModel.id}`);
+    return selectedModel.id;
   }
 
-  async selectModel(): Promise<string> {
-    logger.info("MODEL_SETUP", "🎯 Starting model selection...");
+  async selectLanguage(
+    rl: Readline,
+    options: { defaultLanguageCode?: string } = {},
+  ): Promise<string | null> {
+    logger.info("MODEL_SETUP", "Starting language selection...");
 
-    try {
-      console.log("\n📋 Available OpenRouter Models:\n");
+    const defaultIndex = Math.max(
+      1,
+      SUPPORTED_LANGUAGES.findIndex(
+        (lang) => lang.code === options.defaultLanguageCode,
+      ) + 1 || 1,
+    );
 
-      POPULAR_MODELS.forEach((model, index) => {
-        const num = index + 1;
-        console.log(`${num}. ${model.name}`);
-        if (model.description) {
-          console.log(`   └─ ${model.description}`);
-        }
-      });
+    console.log(theme.text("Available languages:\n"));
 
-      console.log(`\n${POPULAR_MODELS.length + 1}. Enter custom model ID`);
-      console.log(`${POPULAR_MODELS.length + 2}. Cancel setup\n`);
+    SUPPORTED_LANGUAGES.forEach((lang, index) => {
+      const num = index + 1;
+      const badges = [
+        lang.code === options.defaultLanguageCode ? theme.success("current") : "",
+      ].filter(Boolean).join(theme.muted(" • "));
+      const suffix = badges ? ` ${theme.muted(`[${badges}]`)}` : "";
 
-      const choice = await this.rl.question("Select a model (enter number): ");
-      const selection = parseInt(choice.trim(), 10);
-
-      if (
-        selection < 1 ||
-        selection > POPULAR_MODELS.length + 2 ||
-        isNaN(selection)
-      ) {
-        logger.warn("MODEL_SETUP", "Invalid selection");
-        console.log("❌ Invalid selection. Please try again.\n");
-        return this.selectModel();
-      }
-
-      if (selection === POPULAR_MODELS.length + 2) {
-        logger.info("MODEL_SETUP", "Setup cancelled by user");
-        console.log("Setup cancelled.\n");
-        this.rl.close();
-        return "";
-      }
-
-      if (selection === POPULAR_MODELS.length + 1) {
-        const customModel = await this.rl.question("Enter model ID: ");
-        const modelId = customModel.trim();
-
-        if (!modelId) {
-          logger.warn("MODEL_SETUP", "Empty custom model ID");
-          console.log("❌ Model ID cannot be empty.\n");
-          return this.selectModel();
-        }
-
-        logger.info("MODEL_SETUP", `Custom model selected: ${modelId}`);
-        this.rl.close();
-        return modelId;
-      }
-
-      if (selection >= 1 && selection <= POPULAR_MODELS.length) {
-        const selectedModel = POPULAR_MODELS[selection - 1]!;
-        logger.info(
-          "MODEL_SETUP",
-          `Model selected: ${selectedModel.id} (${selectedModel.name})`,
-        );
-        console.log(
-          `\n✅ Selected: ${selectedModel.name} (${selectedModel.id})\n`,
-        );
-
-        this.rl.close();
-        return selectedModel.id;
-      }
-
-      logger.warn("MODEL_SETUP", "Invalid model selection");
-      console.log("❌ Invalid selection. Please try again.\n");
-      return this.selectModel();
-    } catch (error) {
-      logger.error("MODEL_SETUP", "Error during model selection:", error);
-      this.rl.close();
-      throw error;
-    }
-  }
-
-  async saveModelToStore(store: Store, model: string): Promise<void> {
-    if (model) {
-      store.setModel(model);
-      store.setLanguage(this.selectedLanguage);
-      logger.info("MODEL_SETUP", `✅ Model saved to configuration: ${model}`);
-      logger.info(
-        "MODEL_SETUP",
-        `✅ Language saved to configuration: ${this.selectedLanguage}`,
+      console.log(
+        `${theme.accent(`${num}.`)} ${theme.text(lang.name)} ${theme.muted(`(${lang.code})`)}${suffix}`,
       );
+    });
+
+    console.log(
+      `\n${theme.accent(`${SUPPORTED_LANGUAGES.length + 1}.`)} ${theme.text("Cancel")}\n`,
+    );
+
+    const choice = await rl.question(
+      `${theme.accent("Select a language")}${theme.muted(` [${defaultIndex}]`)}: `,
+    );
+    const selection = Number.parseInt(choice.trim() || String(defaultIndex), 10);
+
+    if (
+      !Number.isFinite(selection) ||
+      selection < 1 ||
+      selection > SUPPORTED_LANGUAGES.length + 1
+    ) {
+      console.log(theme.danger("Invalid selection. Please try again.\n"));
+      return this.selectLanguage(rl, options);
     }
+
+    if (selection === SUPPORTED_LANGUAGES.length + 1) {
+      logger.info("MODEL_SETUP", "Language selection cancelled by user");
+      return null;
+    }
+
+    const selected = SUPPORTED_LANGUAGES[selection - 1]!;
+    this.selectedLanguage = selected.code;
+    console.log(
+      `\n${theme.success("Selected")}: ${theme.text(selected.name)} ${theme.muted(`(${selected.code})`)}\n`,
+    );
+    logger.info("MODEL_SETUP", `Language selected: ${selected.code}`);
+    return selected.code;
+  }
+
+  saveToStore(store: Store, input: { model: string; language: string }) {
+    store.setModel(input.model);
+    store.setLanguage(input.language);
+    logger.info("MODEL_SETUP", `Model saved to configuration: ${input.model}`);
+    logger.info(
+      "MODEL_SETUP",
+      `Language saved to configuration: ${input.language}`,
+    );
   }
 }

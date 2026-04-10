@@ -33,6 +33,10 @@ export class Logger {
     this.debugMode = enabled;
   }
 
+  isDebugModeEnabled(): boolean {
+    return this.debugMode;
+  }
+
   private formatTimestamp(): string {
     const now = new Date();
     const time = now.toLocaleTimeString();
