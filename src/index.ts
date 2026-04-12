@@ -288,6 +288,20 @@ async function main() {
 
   function refreshSummarizerConfig() {
     summarizer.setModel(store.getModel());
+    summarizer.setLanguage(store.getLanguage());
+    summarizer.setFrequencyLevel(
+      Number.parseInt(
+        store.getConfigEnum("message_frequency_level", ["1", "2", "3"] as const, "2"),
+        10,
+      ) as MessageFrequencyLevel,
+    );
+    summarizer.setPersonality(
+      store.getConfigEnum(
+        "personality",
+        ["technical", "collaborative", "creative"] as const,
+        "collaborative",
+      ) as Personality,
+    );
     summarizer.setThinkingEffort(store.getThinkingEffort());
   }
 
@@ -423,7 +437,7 @@ async function main() {
     ui.setStatus("Thinking...");
 
     try {
-      const slashOutput = handleSlashCommand(text, store, {
+      const slashOutput = await handleSlashCommand(text, store, {
         runtimeStats: latestRuntimeStats,
       });
       refreshSummarizerConfig();
@@ -468,8 +482,7 @@ async function main() {
 
       const fallbackContext = buildFallbackContext(store, text);
       const userIntent = buildUserIntentContext(store);
-      const progressId = ui.showProgress("Thinking...");
-      const draftId = ui.startAssistantDraft("");
+      let draftId: string | null = null;
       let streamedReply = "";
       let hasStreamedText = false;
       const reply = await summarizer.generateChat({
@@ -481,19 +494,15 @@ async function main() {
         tools,
         fallbackContext,
         onStatus: async (status) => {
-          ui.updateMessage(progressId, {
-            content: status,
-            timestamp: Date.now(),
-          });
+          ui.setStatus(status);
         },
         onTextDelta: async (delta) => {
           streamedReply += delta;
           hasStreamedText = true;
-          ui.setStatus("Streaming...");
-          ui.updateMessage(progressId, {
-            content: "Streaming response...",
-            timestamp: Date.now(),
-          });
+          ui.setStatus("Responding...");
+          if (!draftId) {
+            draftId = ui.startAssistantDraft("");
+          }
           ui.updateMessage(draftId, {
             content: streamedReply,
             timestamp: Date.now(),
@@ -501,12 +510,11 @@ async function main() {
         },
       });
 
-      await ui.finalizeAssistantDraft(draftId, hasStreamedText ? streamedReply : reply);
-      ui.updateMessage(progressId, {
-        content: "Response ready.",
-        timestamp: Date.now(),
-        transient: false,
-      });
+      if (draftId) {
+        await ui.finalizeAssistantDraft(draftId, hasStreamedText ? streamedReply : reply);
+      } else {
+        await ui.showAssistantMessage(reply);
+      }
       store.addMessage({
         role: "assistant",
         channel: "chat",

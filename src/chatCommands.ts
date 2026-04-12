@@ -2,6 +2,18 @@ import { POPULAR_MODELS } from "./modelSetup.js";
 import { type ActivityEvent, Store } from "./store.js";
 import { THEME_OPTIONS, isThemeName } from "./theme.js";
 
+interface OpenRouterModelSummary {
+  id: string;
+  name?: string;
+  description?: string;
+  context_length?: number;
+  pricing?: {
+    prompt?: string;
+    completion?: string;
+  };
+  supported_parameters?: string[];
+}
+
 export interface ChatCommandDefinition {
   command: string;
   usage: string;
@@ -34,7 +46,7 @@ export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
   },
   {
     command: "/model",
-    usage: "/model | /model list | /model set <id|number>",
+    usage: "/model | /model list | /model search <query> | /model set <id|number>",
     description: "Inspect or change the active model.",
   },
   {
@@ -106,6 +118,180 @@ function resolveModelSelection(rawValue: string): string | null {
   }
 
   return value;
+}
+
+function getActiveApiKey(store: Store): string {
+  const inferenceMode = store.getConfig("inference_mode")?.trim() ?? "managed";
+  if (inferenceMode === "byok") {
+    return store.getConfig("openrouter_api_key")?.trim() ?? "";
+  }
+
+  return process.env.OPENROUTER_API_KEY?.trim() ?? "";
+}
+
+function getModelCache(store: Store): OpenRouterModelSummary[] {
+  const raw = store.getConfig("openrouter_models_cache");
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as OpenRouterModelSummary[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function setModelCache(store: Store, models: OpenRouterModelSummary[]) {
+  store.setConfig("openrouter_models_cache", JSON.stringify(models));
+  store.setConfig("openrouter_models_cache_at", new Date().toISOString());
+}
+
+function getLastModelSearchResults(store: Store): string[] {
+  const raw = store.getConfig("model_search_results");
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as string[];
+    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function setLastModelSearchResults(store: Store, modelIds: string[]) {
+  store.setConfig("model_search_results", JSON.stringify(modelIds));
+  store.setConfig("model_search_results_at", new Date().toISOString());
+}
+
+function resolveModelSelectionWithSearch(store: Store, rawValue: string): string | null {
+  const value = rawValue.trim();
+  if (!value) return null;
+
+  const numericSelection = Number.parseInt(value, 10);
+  if (Number.isFinite(numericSelection)) {
+    const searchResults = getLastModelSearchResults(store);
+    const selectedSearchModel = searchResults[numericSelection - 1];
+    if (selectedSearchModel) return selectedSearchModel;
+  }
+
+  return resolveModelSelection(value);
+}
+
+function formatPrice(rawPrice?: string): string {
+  if (!rawPrice) return "-";
+  const parsed = Number.parseFloat(rawPrice);
+  if (!Number.isFinite(parsed) || parsed <= 0) return rawPrice;
+  return `$${parsed.toFixed(parsed < 0.001 ? 6 : 4)}/1K tok`;
+}
+
+function rankModel(query: string, model: OpenRouterModelSummary): number {
+  const q = query.trim().toLowerCase();
+  const id = model.id.toLowerCase();
+  const name = (model.name ?? "").toLowerCase();
+  const description = (model.description ?? "").toLowerCase();
+
+  if (id === q) return 1000;
+  if (name === q) return 950;
+  if (id.startsWith(q)) return 900;
+  if (name.startsWith(q)) return 850;
+  if (id.includes(q)) return 750;
+  if (name.includes(q)) return 700;
+  if (description.includes(q)) return 500;
+  return 0;
+}
+
+async function fetchOpenRouterModels(store: Store): Promise<OpenRouterModelSummary[]> {
+  const apiKey = getActiveApiKey(store);
+  if (!apiKey) {
+    throw new Error("OpenRouter API key is not configured.");
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/models", {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenRouter models request failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payload = await response.json() as { data?: OpenRouterModelSummary[] };
+  const models = Array.isArray(payload.data) ? payload.data : [];
+  setModelCache(store, models);
+  return models;
+}
+
+async function getSearchableModels(store: Store): Promise<OpenRouterModelSummary[]> {
+  const cachedModels = getModelCache(store);
+  const cachedAt = store.getConfig("openrouter_models_cache_at");
+  const maxAgeMs = 24 * 60 * 60 * 1000;
+
+  if (cachedModels.length > 0 && cachedAt) {
+    const ageMs = Date.now() - new Date(cachedAt).getTime();
+    if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < maxAgeMs) {
+      return cachedModels;
+    }
+  }
+
+  try {
+    return await fetchOpenRouterModels(store);
+  } catch (error) {
+    if (cachedModels.length > 0) return cachedModels;
+    throw error;
+  }
+}
+
+async function searchModels(
+  store: Store,
+  query: string,
+): Promise<OpenRouterModelSummary[]> {
+  const models = await getSearchableModels(store);
+  const ranked = models
+    .map((model) => ({ model, score: rankModel(query, model) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.model.id.localeCompare(b.model.id))
+    .slice(0, 12)
+    .map((entry) => entry.model);
+
+  setLastModelSearchResults(
+    store,
+    ranked.map((model) => model.id),
+  );
+
+  return ranked;
+}
+
+function formatModelSearchResults(
+  store: Store,
+  query: string,
+  models: OpenRouterModelSummary[],
+): string {
+  const currentModel = store.getModel();
+
+  if (models.length === 0) {
+    return [
+      `No models found for "${query}".`,
+      "",
+      "Try `/model search claude`, `/model search gpt-4o`, or `/model search llama`.",
+    ].join("\n");
+  }
+
+  return [
+    `Model search results for "${query}":`,
+    ...models.map((model, index) => {
+      const active = model.id === currentModel ? " [current]" : "";
+      const context = model.context_length ? `ctx ${model.context_length}` : "ctx -";
+      const promptPrice = `in ${formatPrice(model.pricing?.prompt)}`;
+      const completionPrice = `out ${formatPrice(model.pricing?.completion)}`;
+      const label = model.name && model.name !== model.id
+        ? `${model.name} - ${model.id}`
+        : model.id;
+      return `${index + 1}. ${label}${active}\n   ${context} | ${promptPrice} | ${completionPrice}`;
+    }),
+    "",
+    "Use `/model set <number>` to pick one of these results, or `/model set <id>` for an exact model ID.",
+  ].join("\n");
 }
 
 function formatModelList(store: Store): string {
@@ -284,11 +470,11 @@ export function buildUserIntentContext(store: Store, limit = 6): string {
   ].join("\n");
 }
 
-export function handleSlashCommand(
+export async function handleSlashCommand(
   text: string,
   store: Store,
   context: ChatCommandContext = {},
-): ChatCommandResult | null {
+) : Promise<ChatCommandResult | null> {
   if (!text.startsWith("/")) return null;
 
   const [rawCommand, ...args] = text.trim().split(/\s+/);
@@ -313,6 +499,7 @@ export function handleSlashCommand(
           `Current model: ${store.getModel()}`,
           "",
           "Use `/model list` to see popular models.",
+          "Use `/model search <query>` to search OpenRouter models.",
           "Use `/model set <id|number>` to change the model.",
           ].join("\n"),
         };
@@ -322,12 +509,33 @@ export function handleSlashCommand(
       if (subcommand?.toLowerCase() === "list") {
         return { output: formatModelList(store) };
       }
+      if (subcommand?.toLowerCase() === "search") {
+        const query = rest.join(" ").trim();
+        if (!query) {
+          return { output: "Usage: /model search <query>" };
+        }
+
+        try {
+          const results = await searchModels(store, query);
+          return { output: formatModelSearchResults(store, query, results) };
+        } catch (error) {
+          return {
+            output:
+              error instanceof Error
+                ? `Model search failed: ${error.message}`
+                : "Model search failed.",
+          };
+        }
+      }
 
       const rawSelection =
         subcommand?.toLowerCase() === "set" ? rest.join(" ") : args.join(" ");
-      const selectedModel = resolveModelSelection(rawSelection);
+      const selectedModel = resolveModelSelectionWithSearch(store, rawSelection);
       if (!selectedModel) {
-        return { output: "Usage: /model | /model list | /model set <id|number>" };
+        return {
+          output:
+            "Usage: /model | /model list | /model search <query> | /model set <id|number>",
+        };
       }
 
       store.setModel(selectedModel);

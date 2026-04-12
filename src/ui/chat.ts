@@ -253,10 +253,12 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     // Replacing the whole object would sever that link and crash sattr.
     headerDivider.style.fg = theme.border;
     headerDivider.style.bg = theme.panel;
-    transcript.style = {
-      fg: theme.text,
-      bg: theme.background,
-    };
+    transcript.style.fg = theme.text;
+    transcript.style.bg = theme.background;
+    transcript.style.track = transcript.style.track ?? {};
+    transcript.style.scrollbar = transcript.style.scrollbar ?? {};
+    transcript.style.track.bg = theme.track;
+    transcript.style.scrollbar.bg = theme.border;
     transcript.scrollbar.track.bg = theme.track;
     transcript.scrollbar.style.bg = theme.border;
     commandMenu.style = {
@@ -322,16 +324,8 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   }
 
   function placeCaret(relativeCursor: number) {
-    const lpos = input.lpos;
-    if (!lpos) {
-      screen.program.hideCursor();
-      return;
-    }
-
-    const x = lpos.xi + 2 + relativeCursor;
-    const y = lpos.yi + 1;
-    screen.program.showCursor();
-    screen.program.cup(y, x);
+    void relativeCursor;
+    screen.program.hideCursor();
   }
 
   function renderInput() {
@@ -521,7 +515,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     clearInput();
     if (!text) return;
     logger.debug("UI", "User submitted input");
-    submitHandler?.(text);
+    setImmediate(() => {
+      submitHandler?.(text);
+    });
   }
 
   function insertText(text: string) {

@@ -1,5 +1,5 @@
-import { createOpenAI } from "@ai-sdk/openai";
-import { generateText, streamText } from "ai";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { generateText } from "ai";
 import { logger } from "./logger.js";
 import { shield } from "./shield.js";
 import type { ActivityEvent, StoredMessage } from "./store.js";
@@ -37,7 +37,7 @@ export interface SummarizerOptions {
 }
 
 export class Summarizer {
-  private client: ReturnType<typeof createOpenAI>;
+  private client: ReturnType<typeof createOpenRouter>;
   private model: string;
   private language: string;
   private apiKey?: string;
@@ -54,8 +54,7 @@ export class Summarizer {
     this.thinkingEffort = options.thinkingEffort ?? "medium";
 
     logger.debug("AI", "Initializing OpenRouter client");
-    this.client = createOpenAI({
-      baseURL: "https://openrouter.ai/api/v1",
+    this.client = createOpenRouter({
       apiKey: this.apiKey,
     });
     logger.debug("AI", "OpenRouter client initialized");
@@ -72,9 +71,32 @@ export class Summarizer {
     return this.model;
   }
 
+  private assertConfigured(): void {
+    if (!this.apiKey?.trim()) {
+      throw new Error(
+        "OpenRouter API key is not configured. Run /setup or set OPENROUTER_API_KEY.",
+      );
+    }
+  }
+
   setModel(model: string) {
     this.model = model.trim() || "anthropic/claude-3.5-haiku";
     logger.debug("AI", `Model updated: ${this.model}`);
+  }
+
+  setLanguage(language: string) {
+    this.language = language.trim() || "en";
+    logger.debug("AI", `Language updated: ${this.language}`);
+  }
+
+  setFrequencyLevel(level: MessageFrequencyLevel) {
+    this.frequencyLevel = level;
+    logger.debug("AI", `Frequency level updated: ${this.frequencyLevel}`);
+  }
+
+  setPersonality(personality: Personality) {
+    this.personality = personality;
+    logger.debug("AI", `Personality updated: ${this.personality}`);
   }
 
   getThinkingEffort(): ThinkingEffort {
@@ -86,11 +108,30 @@ export class Summarizer {
     logger.debug("AI", `Thinking effort updated: ${this.thinkingEffort}`);
   }
 
+  private buildChatModel() {
+    return this.client.chat(this.model, {
+      reasoning: {
+        effort: this.thinkingEffort,
+      },
+    });
+  }
+
+  private supportsToolCalling(): boolean {
+    const model = this.model.trim().toLowerCase();
+    return model.startsWith("openai/") || model.startsWith("anthropic/");
+  }
+
+  private isLikelyCodeQuery(text: string): boolean {
+    return /(where|implement|function|class|method|module|file|path|src\/|\.ts|\.js|\.tsx|\.jsx|error|bug|fix|stack|trace|why)/i
+      .test(text);
+  }
+
   async generateSummary(
     events: ActivityEvent[],
     previousSummary?: string,
     userIntent?: string,
   ): Promise<string> {
+    this.assertConfigured();
     logger.debug("AI", `Generating summary for ${events.length} events`);
 
     const eventCounts = events
@@ -125,11 +166,10 @@ export class Summarizer {
 
     try {
       const { text } = await generateText({
-        model: this.client(this.model),
+        model: this.buildChatModel(),
         maxTokens: maxTokensByLevel[this.frequencyLevel],
         system,
         prompt,
-        providerOptions: this.buildProviderOptions(),
       });
 
       logger.aiResponse(text.length);
@@ -193,6 +233,7 @@ export class Summarizer {
     previousSummary?: string,
     userIntent?: string,
   ): Promise<string> {
+    this.assertConfigured();
     const system = this.buildSummarySystemPrompt();
     const prompt = this.buildDiffSummaryPrompt(
       diffSummary,
@@ -209,7 +250,7 @@ export class Summarizer {
     logger.aiRequest(prompt.length);
 
     const { text } = await generateText({
-      model: this.client(this.model),
+      model: this.buildChatModel(),
       maxTokens: maxTokensByLevel[this.frequencyLevel],
       system,
       prompt,
@@ -224,6 +265,11 @@ export class Summarizer {
   }
 
   async generateChat(input: GenerateChatInput): Promise<string> {
+    this.assertConfigured();
+    const useTools =
+      Boolean(input.tools) &&
+      this.supportsToolCalling() &&
+      this.isLikelyCodeQuery(input.userMessage);
     const system = this.buildChatSystemPrompt();
     const messages = this.buildChatMessages({
       userMessage: input.userMessage,
@@ -231,18 +277,22 @@ export class Summarizer {
       previousSummary: input.previousSummary,
       previousChatSummary: input.previousChatSummary,
       userIntent: input.userIntent,
+      fallbackContext:
+        !useTools && this.isLikelyCodeQuery(input.userMessage)
+          ? input.fallbackContext
+          : undefined,
     });
 
     try {
       return await this.generateChatCompletion({
         system,
         messages,
-        tools: input.tools,
+        tools: useTools ? input.tools : undefined,
         onTextDelta: input.onTextDelta,
         onStatus: input.onStatus,
       });
     } catch (error) {
-      if (!input.tools) throw error;
+      if (!useTools) throw error;
 
       logger.warn(
         "AI",
@@ -272,6 +322,7 @@ export class Summarizer {
     messages: StoredMessage[],
     previousChatSummary?: string,
   ): Promise<string> {
+    this.assertConfigured();
     const transcript = messages
       .map((message) => {
         const role = message.role.toUpperCase();
@@ -297,11 +348,10 @@ export class Summarizer {
     logger.aiRequest(prompt.length);
 
     const { text } = await generateText({
-      model: this.client(this.model),
+      model: this.buildChatModel(),
       system,
       prompt,
       maxTokens: 320,
-      providerOptions: this.buildProviderOptions(),
     });
 
     if (text.trim().length === 0) {
@@ -320,6 +370,13 @@ export class Summarizer {
     onStatus?: (status: string) => void | Promise<void>;
   }): Promise<string> {
     const toolEnabled = Boolean(input.tools);
+    const abortController = new AbortController();
+    const timeoutMs = 45_000;
+    const timeout = setTimeout(() => {
+      abortController.abort(
+        new Error(`AI provider timed out after ${Math.floor(timeoutMs / 1000)}s`),
+      );
+    }, timeoutMs);
 
     const maxTokensByLevel: Record<MessageFrequencyLevel, number> = {
       1: 1200,
@@ -327,49 +384,55 @@ export class Summarizer {
       3: 3600,
     };
 
-    const response = streamText({
-      model: this.client(this.model),
-      system: input.system,
-      messages: input.messages.map((message) => ({
-        role: message.role,
-        content: shield.sanitize(message.content),
-      })),
-      tools: input.tools as any,
-      toolChoice: toolEnabled ? "auto" : undefined,
-      maxSteps: toolEnabled ? 5 : undefined,
-      maxTokens: maxTokensByLevel[this.frequencyLevel],
-      providerOptions: this.buildProviderOptions(),
-      onChunk: input.onTextDelta
-        ? async ({ chunk }) => {
-            if (chunk.type === "text-delta") {
-              await input.onTextDelta?.(chunk.textDelta);
-            }
-          }
-        : undefined,
-      onStepFinish: toolEnabled
-        ? async (step) => {
-            if ((step.toolCalls?.length ?? 0) > 0) {
-              await input.onStatus?.("Calling tools...");
-            } else {
-              await input.onStatus?.("Thinking...");
-            }
-            logger.debug("AI", "Chat step finished", {
-              finishReason: step.finishReason,
-              toolCalls: step.toolCalls?.length ?? 0,
-              toolResults: step.toolResults?.length ?? 0,
-            });
-          }
-        : undefined,
-    });
+    logger.aiRequest(
+      input.messages.reduce((total, message) => total + message.content.length, 0),
+    );
 
-    const text = await response.text;
+    try {
+      await input.onStatus?.("Thinking...");
 
-    if (text.trim().length === 0) {
-      throw new Error("Empty response returned from AI provider");
+      const response = await generateText({
+        model: this.buildChatModel(),
+        system: input.system,
+        messages: input.messages.map((message) => ({
+          role: message.role,
+          content: shield.sanitize(message.content),
+        })),
+        tools: input.tools as any,
+        toolChoice: toolEnabled ? "auto" : undefined,
+        maxSteps: toolEnabled ? 5 : undefined,
+        maxTokens: maxTokensByLevel[this.frequencyLevel],
+        abortSignal: abortController.signal,
+        onStepFinish: toolEnabled
+          ? async (step) => {
+              if ((step.toolCalls?.length ?? 0) > 0) {
+                await input.onStatus?.("Calling tools...");
+              } else {
+                await input.onStatus?.("Thinking...");
+              }
+              logger.debug("AI", "Chat step finished", {
+                finishReason: step.finishReason,
+                toolCalls: step.toolCalls?.length ?? 0,
+                toolResults: step.toolResults?.length ?? 0,
+              });
+            }
+          : undefined,
+      });
+
+      const text = response.text;
+
+      if (text.trim().length === 0) {
+        throw new Error("Empty response returned from AI provider");
+      }
+
+      logger.aiResponse(text.length);
+      return text;
+    } catch (error) {
+      logger.aiError(error);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    logger.aiResponse(text.length);
-    return text;
   }
 
   private buildSummarySystemPrompt(): string {
@@ -385,14 +448,6 @@ export class Summarizer {
       "If explicit user guidance conflicts with inferred activity, explicit user guidance wins.",
       "Be grounded in the provided context. Do not claim actions were taken unless explicitly stated.",
     ].join("\n");
-  }
-
-  private buildProviderOptions(): Record<string, Record<string, string>> {
-    return {
-      openai: {
-        reasoningEffort: this.thinkingEffort,
-      },
-    };
   }
 
   private buildChatSystemPrompt(): string {

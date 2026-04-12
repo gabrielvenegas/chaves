@@ -9,7 +9,7 @@
     "setup:project:path": "./scripts/setup-project.sh"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^1.0.0",
+    "@openrouter/ai-sdk-provider": "^0.5.0",
     "@types/diff": "^8.0.0",
     "ai": "^4.0.0",
     "better-sqlite3": "^11.0.0",
