@@ -189,6 +189,11 @@ export class Store {
         stream TEXT NOT NULL,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS working_memory (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
       CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel);
       CREATE INDEX IF NOT EXISTS idx_chat_summaries_range ON chat_summaries(message_range_end);
@@ -830,6 +835,44 @@ export class Store {
       .run("theme", theme);
 
     logger.debug("STORE", "Theme configuration saved");
+  }
+
+  getWorkingMemory(): Record<string, string> {
+    const rows = this.db
+      .prepare(`SELECT key, value FROM working_memory`)
+      .all() as Array<{ key: string; value: string }>;
+
+    const memory: Record<string, string> = {};
+    for (const row of rows) {
+      memory[row.key] = row.value;
+    }
+    return memory;
+  }
+
+  updateWorkingMemory(updates: Record<string, string | null>): void {
+    const timestamp = new Date().toISOString();
+
+    const transaction = this.db.transaction(() => {
+      for (const [key, value] of Object.entries(updates)) {
+        if (value === null) {
+          this.db.prepare(`DELETE FROM working_memory WHERE key = ?`).run(key);
+        } else {
+          this.db
+            .prepare(
+              `
+            INSERT INTO working_memory (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+              value = excluded.value,
+              updated_at = excluded.updated_at
+          `,
+            )
+            .run(key, value, timestamp);
+        }
+      }
+    });
+
+    transaction();
   }
 
   getConfig(key: string): string | null {

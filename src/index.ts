@@ -17,6 +17,8 @@ import {
   Summarizer,
   type MessageFrequencyLevel,
   type Personality,
+  type ProactiveInsight,
+  type SessionGoalContext,
 } from "./summarizer.js";
 import {
   Store,
@@ -96,6 +98,28 @@ function mapToChatHistory(messages: StoredMessage[]): Array<{
     role: message.role,
     content: message.content,
   }));
+}
+
+interface SessionGoalState extends SessionGoalContext {
+  updatedAt: number;
+}
+
+function normalizeRelatedFiles(paths: string[]): string[] {
+  return [...new Set(paths.map((path) => path.trim()).filter(Boolean))].slice(0, 3);
+}
+
+function buildProactiveMessage(insight: ProactiveInsight): string {
+  const lines = [
+    `Focus: ${insight.goal} -> ${insight.focus}`,
+    `Suggestion: ${insight.suggestionText}`,
+  ];
+
+  const relatedFiles = normalizeRelatedFiles(insight.relatedFiles);
+  if (relatedFiles.length > 0) {
+    lines.push(`Related files: ${relatedFiles.join(", ")}`);
+  }
+
+  return lines.join("\n");
 }
 
 async function runTmuxRelayMode(projectPath: string): Promise<void> {
@@ -278,6 +302,7 @@ async function main() {
   let lastSummary = store.getLastSummary();
   let lastChatSummary = store.getLastChatSummary();
   let lastChatSummaryEndMessageId = lastChatSummary?.message_range_end ?? 0;
+  let sessionGoalState: SessionGoalState | null = null;
   let lastCpuUsage = process.cpuUsage();
   let lastCpuSampleAt = process.hrtime.bigint();
   let latestRuntimeStats = {
@@ -432,6 +457,115 @@ async function main() {
     }
   }
 
+  async function maybeExtractMemory() {
+    const pendingChatMessages = store.getMessagesSince(
+      lastChatSummaryEndMessageId,
+      "chat",
+    );
+
+    if (pendingChatMessages.length < 1) return;
+
+    try {
+      const currentMemory = store.getWorkingMemory();
+      const updates = await summarizer.extractSessionMemory(
+        pendingChatMessages,
+        currentMemory,
+      );
+
+      if (Object.keys(updates).length > 0) {
+        store.updateWorkingMemory(updates);
+        logger.debug("APP", `Updated durable memory with ${Object.keys(updates).length} changes`);
+      }
+    } catch (error) {
+      logger.error("APP", "Memory extraction failed", error);
+    }
+  }
+
+  function applySessionGoalInsight(insight: ProactiveInsight): {
+    shouldDisplay: boolean;
+    message: string;
+  } {
+    const normalizedFiles = normalizeRelatedFiles(insight.relatedFiles);
+    const nextState: SessionGoalState = {
+      goal: insight.goal.trim(),
+      focus: insight.focus.trim(),
+      status: insight.status,
+      suggestionKey: insight.suggestionKey.trim(),
+      suggestionText: insight.suggestionText.trim(),
+      relatedFiles: normalizedFiles,
+      updatedAt: Date.now(),
+    };
+
+    const previousState = sessionGoalState;
+    sessionGoalState = nextState;
+
+    const sameSuggestion = previousState?.suggestionKey === nextState.suggestionKey;
+    const goalChanged = previousState?.goal !== nextState.goal;
+    const alreadyActive = sameSuggestion && nextState.status === "active";
+    const transitioned =
+      previousState?.status !== nextState.status &&
+      nextState.status !== "active";
+    const shouldDisplay =
+      insight.shouldNotify &&
+      !alreadyActive &&
+      (goalChanged || !sameSuggestion || transitioned || previousState === null);
+
+    return {
+      shouldDisplay,
+      message: buildProactiveMessage({
+        ...insight,
+        relatedFiles: normalizedFiles,
+      }),
+    };
+  }
+
+  async function maybeGenerateProactiveInsight(input: {
+    diffSummary?: string;
+    recentEvents: ActivityEvent[];
+    eventRangeEnd: number;
+  }) {
+    if (isSummarizing) return;
+
+    isSummarizing = true;
+
+    try {
+      const insight = await summarizer.generateProactiveInsight({
+        diffSummary: input.diffSummary,
+        recentEvents: input.recentEvents,
+        previousSummary: lastSummary?.content,
+        previousChatSummary: lastChatSummary?.content,
+        userIntent: buildUserIntentContext(store),
+        previousInsight: sessionGoalState,
+      });
+
+      const { shouldDisplay, message } = applySessionGoalInsight(insight);
+      const summaryRangeStart = lastSummarizedEventId;
+      lastSummarizedEventId = Math.max(lastSummarizedEventId, input.eventRangeEnd);
+
+      if (!shouldDisplay) return;
+
+      store.saveSummary(message, summaryRangeStart, input.eventRangeEnd);
+      lastSummary = { content: message, event_range_end: input.eventRangeEnd };
+      await ui.showSummary(message);
+      store.addMessage({
+        role: "assistant",
+        channel: "proactive",
+        content: message,
+        sessionId,
+      });
+    } catch (error) {
+      logger.error("APP", "Proactive insight generation failed:", error);
+      if (error instanceof Error) {
+        logger.error("APP", `Error details: ${error.message}`);
+      }
+    } finally {
+      isSummarizing = false;
+      eventsSinceLastSummary = store
+        .getEventsSince(lastSummarizedEventId)
+        .filter(isCountableEvent).length;
+    }
+  }
+
   ui.onUserMessage(async (text) => {
     ui.setWatching(false);
     ui.setStatus("Thinking...");
@@ -453,6 +587,7 @@ async function main() {
           lastSummary = null;
           lastChatSummary = null;
           lastChatSummaryEndMessageId = 0;
+          sessionGoalState = null;
           ui.clearContext();
         }
 
@@ -482,6 +617,7 @@ async function main() {
 
       const fallbackContext = buildFallbackContext(store, text);
       const userIntent = buildUserIntentContext(store);
+      const workingMemory = store.getWorkingMemory();
       let draftId: string | null = null;
       let streamedReply = "";
       let hasStreamedText = false;
@@ -489,6 +625,7 @@ async function main() {
         userMessage: text,
         previousSummary: lastSummary?.content,
         previousChatSummary: lastChatSummary?.content,
+        workingMemory,
         userIntent,
         recentMessages: mapToChatHistory(recentChatMessages),
         tools,
@@ -523,6 +660,7 @@ async function main() {
       });
 
       await maybeSummarizeChatHistory();
+      void maybeExtractMemory();
     } catch (error) {
       logger.error("APP", "Chat response failed:", error);
       ui.showError("Chat response failed", error as Error);
@@ -544,7 +682,7 @@ async function main() {
     if (isSummarizing || eventsSinceLastSummary < SUMMARY_THRESHOLD) return;
 
     isSummarizing = true;
-    logger.info("APP", "Summary threshold reached, generating summary...");
+    logger.info("APP", "Summary threshold reached, generating fallback summary...");
 
     try {
       const newEvents = store.getEventsSince(lastSummarizedEventId);
@@ -705,21 +843,12 @@ async function main() {
         JSON.stringify(payload.changes),
         payload.changes.length,
       );
-
-      const text = await summarizer.generateDiff(
-        payload.prompt,
-        lastSummary?.content,
-        buildUserIntentContext(store),
-      );
-
-      store.saveSummary(text, lastSummarizedEventId, lastSummarizedEventId);
-      lastSummary = { content: text, event_range_end: lastSummarizedEventId };
-      await ui.showSummary(text);
-      store.addMessage({
-        role: "assistant",
-        channel: "proactive",
-        content: text,
-        sessionId,
+      const recentEvents = store.getEventsSince(lastSummarizedEventId);
+      const eventRangeEnd = recentEvents.at(-1)?.id ?? lastSummarizedEventId;
+      await maybeGenerateProactiveInsight({
+        diffSummary: payload.prompt,
+        recentEvents,
+        eventRangeEnd,
       });
     } catch (error) {
       logger.error("APP", "Diff summary failed:", error);
