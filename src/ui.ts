@@ -127,12 +127,28 @@ export class UI {
   }
 
   async finalizeAssistantDraft(id: string, content: string) {
-    this.chat.updateMessage(id, {
-      role: "assistant",
-      content: `${content}`.trim(),
-      timestamp: Date.now(),
-      transient: false,
-    });
+    try {
+      const rendered = await this.markdownRenderer.render(content);
+      const formatted = `${rendered}`.trim();
+      this.chat.updateMessage(id, {
+        role: "assistant",
+        content: formatted.length > 0 ? formatted : content.trim(),
+        timestamp: Date.now(),
+        transient: false,
+      });
+    } catch (error) {
+      logger.error(
+        "UI",
+        "Failed to render markdown for assistant draft, falling back to plain text:",
+        error,
+      );
+      this.chat.updateMessage(id, {
+        role: "assistant",
+        content: `${content}`.trim(),
+        timestamp: Date.now(),
+        transient: false,
+      });
+    }
   }
 
   async showSummary(summary: string) {

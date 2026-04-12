@@ -78,7 +78,7 @@ export class Logger {
       }
     }
 
-    console.log(output);
+    process.stderr.write(output + "\n");
   }
 
   debug(category: string, message: string, data?: any) {
