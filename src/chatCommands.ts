@@ -1,3 +1,5 @@
+import { writeFileSync } from "fs";
+import { join } from "path";
 import { POPULAR_MODELS } from "./modelSetup.js";
 import { type ActivityEvent, Store } from "./store.js";
 import { THEME_OPTIONS, isThemeName } from "./theme.js";
@@ -88,6 +90,11 @@ export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
     command: "/clear",
     usage: "/clear",
     description: "Clear chat and runtime context, but keep indexed files.",
+  },
+  {
+    command: "/export",
+    usage: "/export",
+    description: "Export the current conversation to a markdown file.",
   },
 ] as const;
 
@@ -688,6 +695,36 @@ export async function handleSlashCommand(
           "Context cleared. Chat history, summaries, events, diffs, and terminal logs were removed. Indexed files were preserved.",
         effect: "clear_context",
       };
+
+    case "/export": {
+      const messages = store.getRecentMessages({ limit: 10000, channel: "chat" });
+      if (messages.length === 0) return { output: "No conversation to export." };
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `chaves-export-${timestamp}.md`;
+      const filepath = join(store.getProjectPath(), filename);
+
+      const content = [
+        "# CHAVES Conversation Export",
+        `Date: ${new Date().toLocaleString()}`,
+        `Model: ${store.getModel()}`,
+        "",
+        ...messages.reverse().map((msg) => {
+          const role = msg.role.toUpperCase();
+          const ts = new Date(msg.timestamp).toLocaleString();
+          return `### ${role} (${ts})\n\n${msg.content}\n\n---`;
+        }),
+      ].join("\n");
+
+      try {
+        writeFileSync(filepath, content, "utf8");
+        return { output: `Conversation exported to: ${filename}` };
+      } catch (error) {
+        return {
+          output: `Export failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
 
     default:
       return {

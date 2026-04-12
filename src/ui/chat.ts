@@ -193,22 +193,29 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   let cachedCols = 0;
 
   let scrollOffset = 0;
+  let unreadCount = 0;
   let inputLine = "";
   let inputCursor = 0;
+  let multiLineBuffer: string[] = [];
   let matchingCommands: readonly ChatCommandDefinition[] = [];
   let renderPending = false;
+  let lastRenderTime = 0;
 
   // ── Layout constants ─────────────────────────────────────────────────────
   // Header: 3 rows (top border + subtitle + separator)
-  // Footer: 5 rows (input-sep + input + status-sep + status + bottom border)
-  // Viewport: rows 4 .. (rows - 5)
+  // Footer: 5 rows base (input-sep + input + status-sep + status + bottom border)
+  // Viewport: rows 4 .. (rows - FOOTER)
 
   const HEADER = 3;
-  const FOOTER = 5;
+
+  function getFooterRows() {
+    // Base is 5 rows. Each extra line in multiLineBuffer adds 1 row.
+    return 5 + multiLineBuffer.length;
+  }
 
   function vpStart() { return HEADER + 1; }          // row 4 (1-indexed)
-  function vpEnd()   { return rows - FOOTER; }        // e.g. row 19 for rows=24
-  function inputLineRow() { return vpEnd() + 2; }     // e.g. row 21
+  function vpEnd()   { return rows - getFooterRows(); }
+  function inputLineRow() { return vpEnd() + 2 + multiLineBuffer.length; }
 
   function pickerRowCount() {
     return matchingCommands.length > 0 ? 1 + matchingCommands.length : 0;
@@ -294,7 +301,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     const prefix    = `  ${chalk.hex(theme.assistant).bold("›")} `;
     const available = Math.max(1, iw() - 4);
 
-    if (inputLine.length === 0) {
+    if (inputLine.length === 0 && multiLineBuffer.length === 0) {
       return prefix + truncateVisible(chalk.hex(theme.muted)("Write a message…"), available);
     }
 
@@ -312,6 +319,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   function renderAll() {
     renderPending = false;
     if (destroyed) return;
+    lastRenderTime = Date.now();
 
     if (rows < 10 || cols < 30) {
       process.stdout.write(HIDE_CURSOR + moveTo(1, 1) + CLEAR_SCREEN + moveTo(1, 1) + "Terminal too small." + SHOW_CURSOR);
@@ -333,6 +341,10 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       scrollOffset = 0;
     }
 
+    if (scrollOffset === 0) {
+      unreadCount = 0;
+    }
+
     const buf: string[] = [HIDE_CURSOR, moveTo(1, 1)];
 
     // Row 1: top border
@@ -347,7 +359,19 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     for (let row = vpStart(); row <= vpContentEnd; row++) {
       const lineIdx = sliceStart + (row - vpStart());
       const line    = lineIdx < total ? (allLines[lineIdx] ?? "") : "";
-      buf.push(contentRow(line, cols, theme), "\r\n");
+
+      // Overlay scroll badge if on the last row of the viewport
+      if (row === vpContentEnd && unreadCount > 0 && scrollOffset > 0) {
+        const badgeText = ` ↑ ${unreadCount} new message${unreadCount > 1 ? "s" : ""} — Esc to jump ↓ `;
+        const badge = chalk.bgBlue.white.bold(badgeText);
+        const blen = visibleLength(badgeText);
+        const padding = Math.max(0, Math.floor((iw() - blen) / 2));
+        const left = padToWidth(line.slice(0, padding), padding);
+        const right = padToWidth(line.slice(padding + blen), iw() - padding - blen);
+        buf.push(chalk.hex(theme.border)("│") + left + badge + right + chalk.hex(theme.border)("│"), "\r\n");
+      } else {
+        buf.push(contentRow(line, cols, theme), "\r\n");
+      }
     }
 
     // Command picker
@@ -362,13 +386,19 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
 
     // Footer
     buf.push(midBorder("INPUT", cols, theme), "\r\n");
+
+    // Render multi-line buffer lines
+    for (const line of multiLineBuffer) {
+      buf.push(contentRow(`    ${chalk.hex(theme.muted)(line)}`, cols, theme), "\r\n");
+    }
+
     buf.push(contentRow(inputText(), cols, theme), "\r\n");
     buf.push(midBorder(null, cols, theme), "\r\n");
     buf.push(contentRow(statusText_(), cols, theme), "\r\n");
     buf.push(bottomBorder(cols, theme));  // no \r\n — last row
 
     // Position cursor in input area
-    buf.push(moveTo(inputLineRow(), inputLine.length === 0 ? 6 : cursorCol()));
+    buf.push(moveTo(inputLineRow(), inputLine.length === 0 && multiLineBuffer.length === 0 ? 6 : cursorCol()));
     buf.push(SHOW_CURSOR);
 
     process.stdout.write(buf.join(""));
@@ -377,7 +407,16 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   function scheduleRender() {
     if (renderPending || destroyed) return;
     renderPending = true;
-    setImmediate(renderAll);
+
+    const now = Date.now();
+    const elapsed = now - lastRenderTime;
+    const minDelay = 33; // ~30fps
+
+    if (elapsed >= minDelay) {
+      setImmediate(renderAll);
+    } else {
+      setTimeout(renderAll, minDelay - elapsed);
+    }
   }
 
   // ── Silent readline ───────────────────────────────────────────────────────
@@ -395,7 +434,64 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
 
   readline.emitKeypressEvents(process.stdin, rl);
 
-  process.stdin.on("keypress", (_ch, key) => {
+  process.stdin.prependListener("keypress", (ch, key) => {
+    if (!key || destroyed) return;
+
+    // Scrolling when input is empty or Shift is held
+    if (key.name === "up" || key.name === "down") {
+      if (!inputLine && multiLineBuffer.length === 0) {
+        if (key.name === "up") {
+          scrollOffset += 1;
+        } else {
+          scrollOffset = Math.max(0, scrollOffset - 1);
+        }
+        scheduleRender();
+        // Stop event from reaching readline
+        (rl as any)._input.pause();
+        setImmediate(() => (rl as any)._input.resume());
+        return;
+      }
+    }
+
+    // Shift+Enter or Alt+Enter for multi-line continuation
+    const isEnter = key.name === "return" || key.name === "enter";
+    const isShiftEnter = isEnter && (key.shift || key.sequence === "\x1b[13;2u" || key.sequence === "\x1b[1;2R");
+    const isAltEnter = isEnter && key.meta;
+
+    if (isShiftEnter || isAltEnter) {
+      multiLineBuffer.push(inputLine);
+      inputLine = "";
+      inputCursor = 0;
+      (rl as any).line = "";
+      (rl as any).cursor = 0;
+      scheduleRender();
+      // Stop event from reaching readline's "line" handler
+      (rl as any)._input.pause();
+      setImmediate(() => (rl as any)._input.resume());
+      return;
+    }
+
+    // Ctrl+Arrow fast navigation
+    if (key.ctrl) {
+      if (key.name === "left") {
+        const textBefore = inputLine.slice(0, inputCursor);
+        const match = textBefore.match(/(\s*\w+)$/);
+        const move = match ? match[1]!.length : 1;
+        inputCursor = Math.max(0, inputCursor - move);
+        (rl as any).cursor = inputCursor;
+        scheduleRender();
+      } else if (key.name === "right") {
+        const textAfter = inputLine.slice(inputCursor);
+        const match = textAfter.match(/^(\w+\s*)/);
+        const move = match ? match[1]!.length : 1;
+        inputCursor = Math.min(inputLine.length, inputCursor + move);
+        (rl as any).cursor = inputCursor;
+        scheduleRender();
+      }
+    }
+  });
+
+  process.stdin.on("keypress", (ch, key) => {
     if (!key || destroyed) return;
 
     // PgUp/PgDn: Node.js uses "prior"/"next" for these keys
@@ -411,6 +507,23 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     }
     if (key.name === "escape") {
       scrollOffset = 0;
+      unreadCount = 0;
+      scheduleRender();
+      return;
+    }
+
+    // Jump keys: g (top), G (bottom)
+    if (!inputLine && multiLineBuffer.length === 0 && key.name === "g") {
+      if (key.shift) {
+        // G (Shift+G) -> Bottom
+        scrollOffset = 0;
+        unreadCount = 0;
+      } else {
+        // g -> Top
+        const allLines = getLines();
+        const evh = effectiveVH();
+        scrollOffset = Math.max(0, allLines.length - evh);
+      }
       scheduleRender();
       return;
     }
@@ -425,9 +538,20 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   });
 
   rl.on("line", (line) => {
-    const text = line.trim();
+    if (line.endsWith("\\")) {
+      multiLineBuffer.push(line.slice(0, -1));
+      inputLine = "";
+      inputCursor = 0;
+      (rl as any).line = "";
+      (rl as any).cursor = 0;
+      scheduleRender();
+      return;
+    }
+
+    const text = (multiLineBuffer.join("\n") + "\n" + line).trim();
     inputLine        = "";
     inputCursor      = 0;
+    multiLineBuffer  = [];
     matchingCommands = [];
     scrollOffset     = 0;
     if (text) submitHandler?.(text);
@@ -462,6 +586,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     if (scrollOffset > 0) {
       // Keep current scroll position stable when new content arrives below
       scrollOffset += renderMessageToLines(rec).length;
+      unreadCount++;
     }
 
     invalidate();

@@ -108,8 +108,10 @@ interface ListFilesOptions {
 export class Store {
   private db: Database.Database;
   private hasFts = false;
+  private readonly projectPath: string;
 
   constructor(projectPath: string) {
+    this.projectPath = projectPath;
     const dbPath = join(projectPath, ".chaves.db");
 
     mkdirSync(projectPath, { recursive: true });
@@ -118,6 +120,10 @@ export class Store {
 
     this.db = new Database(dbPath);
     this.init();
+  }
+
+  getProjectPath(): string {
+    return this.projectPath;
   }
 
   private init() {
