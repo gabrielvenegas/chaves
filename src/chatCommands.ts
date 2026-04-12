@@ -1,5 +1,6 @@
 import { POPULAR_MODELS } from "./modelSetup.js";
 import { type ActivityEvent, Store } from "./store.js";
+import { THEME_OPTIONS, isThemeName } from "./theme.js";
 
 export interface ChatCommandDefinition {
   command: string;
@@ -10,6 +11,14 @@ export interface ChatCommandDefinition {
 export interface ChatCommandResult {
   output: string;
   effect?: "clear_context";
+}
+
+interface ChatCommandContext {
+  runtimeStats?: {
+    cpuPercent: number;
+    rssBytes: number;
+    heapUsedBytes: number;
+  };
 }
 
 export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
@@ -27,6 +36,21 @@ export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
     command: "/model",
     usage: "/model | /model list | /model set <id|number>",
     description: "Inspect or change the active model.",
+  },
+  {
+    command: "/thinking",
+    usage: "/thinking | /thinking <low|medium|high>",
+    description: "Inspect or change model reasoning effort.",
+  },
+  {
+    command: "/stats",
+    usage: "/stats",
+    description: "Show active model plus CPU and memory usage.",
+  },
+  {
+    command: "/theme",
+    usage: "/theme | /theme list | /theme set <warm|slate|forest>",
+    description: "Inspect or change the terminal theme.",
   },
   {
     command: "/history",
@@ -101,15 +125,77 @@ function formatSetupSummary(store: Store): string {
   return [
     "Current setup:",
     `- model: ${store.getModel()}`,
+    `- thinking: ${store.getThinkingEffort()}`,
     `- language: ${store.getLanguage()}`,
+    `- theme: ${store.getTheme()}`,
     "",
     "Commands:",
     "- /model",
     "- /model list",
     "- /model set <id|number>",
+    "- /thinking <low|medium|high>",
+    "- /stats",
+    "- /theme set <warm|slate|forest>",
     "",
     "For the full interactive wizard, run `bun run setup` outside the TUI.",
   ].join("\n");
+}
+
+function formatThemeList(store: Store): string {
+  const currentTheme = store.getTheme();
+
+  return [
+    "Themes:",
+    ...THEME_OPTIONS.map((theme, index) => {
+      const active = theme.id === currentTheme ? " [current]" : "";
+      return `${index + 1}. ${theme.id}${active} - ${theme.label}`;
+    }),
+  ].join("\n");
+}
+
+function resolveThemeSelection(rawValue: string): string | null {
+  const value = rawValue.trim().toLowerCase();
+  if (!value) return null;
+
+  const numericSelection = Number.parseInt(value, 10);
+  if (Number.isFinite(numericSelection)) {
+    const selected = THEME_OPTIONS[numericSelection - 1];
+    return selected?.id ?? null;
+  }
+
+  return isThemeName(value) ? value : null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatStatsOutput(
+  store: Store,
+  runtimeStats?: ChatCommandContext["runtimeStats"],
+): string {
+  const lines = [
+    "Runtime:",
+    `- model: ${store.getModel()}`,
+    `- thinking: ${store.getThinkingEffort()}`,
+  ];
+
+  if (!runtimeStats) {
+    lines.push("- cpu: unavailable");
+    lines.push("- rss: unavailable");
+    lines.push("- heap used: unavailable");
+    return lines.join("\n");
+  }
+
+  lines.push(`- cpu: ${runtimeStats.cpuPercent.toFixed(1)}%`);
+  lines.push(`- rss: ${formatBytes(runtimeStats.rssBytes)}`);
+  lines.push(`- heap used: ${formatBytes(runtimeStats.heapUsedBytes)}`);
+
+  return lines.join("\n");
 }
 
 function isCountableEventType(type: ActivityEvent["event_type"]): boolean {
@@ -201,6 +287,7 @@ export function buildUserIntentContext(store: Store, limit = 6): string {
 export function handleSlashCommand(
   text: string,
   store: Store,
+  context: ChatCommandContext = {},
 ): ChatCommandResult | null {
   if (!text.startsWith("/")) return null;
 
@@ -248,7 +335,74 @@ export function handleSlashCommand(
         output: [
         `Model updated: ${selectedModel}`,
         "",
+        `Thinking effort: ${store.getThinkingEffort()}`,
         `Language remains: ${store.getLanguage()}`,
+        ].join("\n"),
+      };
+    }
+
+    case "/thinking": {
+      if (args.length === 0) {
+        return {
+          output: [
+            `Current thinking effort: ${store.getThinkingEffort()}`,
+            "",
+            "Use `/thinking low`, `/thinking medium`, or `/thinking high`.",
+          ].join("\n"),
+        };
+      }
+
+      const value = args[0]?.toLowerCase();
+      if (value !== "low" && value !== "medium" && value !== "high") {
+        return { output: "Usage: /thinking | /thinking <low|medium|high>" };
+      }
+
+      store.setThinkingEffort(value);
+      return {
+        output: [
+          `Thinking effort updated: ${value}`,
+          "",
+          `Model remains: ${store.getModel()}`,
+          `Language remains: ${store.getLanguage()}`,
+        ].join("\n"),
+      };
+    }
+
+    case "/stats":
+      return { output: formatStatsOutput(store, context.runtimeStats) };
+
+    case "/theme": {
+      if (args.length === 0) {
+        return {
+          output: [
+            `Current theme: ${store.getTheme()}`,
+            "",
+            "Use `/theme list` to see available themes.",
+            "Use `/theme set <warm|slate|forest>` to change it.",
+          ].join("\n"),
+        };
+      }
+
+      const [subcommand, ...rest] = args;
+      if (subcommand?.toLowerCase() === "list") {
+        return { output: formatThemeList(store) };
+      }
+
+      const rawSelection =
+        subcommand?.toLowerCase() === "set" ? rest.join(" ") : args.join(" ");
+      const selectedTheme = resolveThemeSelection(rawSelection);
+      if (!selectedTheme || !isThemeName(selectedTheme)) {
+        return {
+          output: "Usage: /theme | /theme list | /theme set <warm|slate|forest>",
+        };
+      }
+
+      store.setTheme(selectedTheme);
+      return {
+        output: [
+          `Theme updated: ${selectedTheme}`,
+          "",
+          `Model remains: ${store.getModel()}`,
         ].join("\n"),
       };
     }

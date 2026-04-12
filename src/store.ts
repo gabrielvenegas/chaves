@@ -558,6 +558,13 @@ export class Store {
     }
   }
 
+  getIndexedFileCount(): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) as count FROM files`)
+      .get() as { count: number };
+    return row?.count ?? 0;
+  }
+
   getFile(path: string): StoredFileRecord | null {
     const safePath = this.assertSafeRelativePath(path);
     const row = this.db
@@ -753,6 +760,70 @@ export class Store {
       .run("response_language", languageCode);
 
     logger.debug("STORE", "Language configuration saved");
+  }
+
+  getThinkingEffort(): "low" | "medium" | "high" {
+    logger.debug("STORE", "Fetching configured thinking effort");
+
+    const config = this.db
+      .prepare(`SELECT value FROM config WHERE key = 'thinking_effort'`)
+      .get() as { value: string } | undefined;
+
+    const value = config?.value;
+    if (value === "low" || value === "high") {
+      logger.debug("STORE", `Using thinking effort: ${value}`);
+      return value;
+    }
+
+    logger.debug("STORE", "Using thinking effort: medium");
+    return "medium";
+  }
+
+  setThinkingEffort(effort: "low" | "medium" | "high"): void {
+    logger.debug("STORE", `Setting thinking effort to: ${effort}`);
+
+    this.db
+      .prepare(
+        `
+      INSERT OR REPLACE INTO config (key, value)
+      VALUES (?, ?)
+    `,
+      )
+      .run("thinking_effort", effort);
+
+    logger.debug("STORE", "Thinking effort configuration saved");
+  }
+
+  getTheme(): "warm" | "slate" | "forest" {
+    logger.debug("STORE", "Fetching configured theme");
+
+    const config = this.db
+      .prepare(`SELECT value FROM config WHERE key = 'theme'`)
+      .get() as { value: string } | undefined;
+
+    const value = config?.value;
+    if (value === "slate" || value === "forest") {
+      logger.debug("STORE", `Using theme: ${value}`);
+      return value;
+    }
+
+    logger.debug("STORE", "Using theme: warm");
+    return "warm";
+  }
+
+  setTheme(theme: "warm" | "slate" | "forest"): void {
+    logger.debug("STORE", `Setting theme to: ${theme}`);
+
+    this.db
+      .prepare(
+        `
+      INSERT OR REPLACE INTO config (key, value)
+      VALUES (?, ?)
+    `,
+      )
+      .run("theme", theme);
+
+    logger.debug("STORE", "Theme configuration saved");
   }
 
   getConfig(key: string): string | null {

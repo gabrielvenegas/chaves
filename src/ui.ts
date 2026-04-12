@@ -1,6 +1,7 @@
 import { MarkdownRenderer } from "./markdown/renderer.js";
 import { CHAT_COMMANDS, PRIMARY_CHAT_COMMANDS } from "./chatCommands.js";
 import { logger } from "./logger.js";
+import type { ThemeName } from "./theme.js";
 import type { ActivityEvent, TerminalEventRecord } from "./store.js";
 import { createChatUI, type ChatMessage, type ChatUI } from "./ui/chat.js";
 
@@ -14,12 +15,19 @@ export class UI {
   private readonly maxEventBuffer = 8;
   private userHandler: UserMessageHandler | null = null;
 
-  constructor({ showPaneToggleHint = false }: { showPaneToggleHint?: boolean } = {}) {
+  constructor({
+    showPaneToggleHint = false,
+    theme = "warm",
+  }: {
+    showPaneToggleHint?: boolean;
+    theme?: ThemeName;
+  } = {}) {
     logger.debug("UI", "UI component initialized (blessed chat)");
     this.markdownRenderer = new MarkdownRenderer();
     this.chat = createChatUI({
       title: "CHAVES",
       initialStatus: "Watching…",
+      theme,
       commandHints: showPaneToggleHint
         ? [...PRIMARY_CHAT_COMMANDS, "Ctrl+L: switch pane"]
         : PRIMARY_CHAT_COMMANDS,
@@ -89,8 +97,8 @@ export class UI {
     return `💭 Events\n${lines.join("\n")}\n`;
   }
 
-  private pushMessage(message: ChatMessage) {
-    this.chat.pushMessage(message);
+  private pushMessage(message: ChatMessage): string {
+    return this.chat.pushMessage(message);
   }
 
   async showAssistantMessage(content: string) {
@@ -114,6 +122,31 @@ export class UI {
         role: "assistant",
         content: `${content}`.trim(),
         timestamp: Date.now(),
+      });
+    }
+  }
+
+  async finalizeAssistantDraft(id: string, content: string) {
+    try {
+      const rendered = await this.markdownRenderer.render(content);
+      const formatted = `${rendered}`.trim();
+      this.chat.updateMessage(id, {
+        role: "assistant",
+        content: formatted.length > 0 ? formatted : content.trim(),
+        timestamp: Date.now(),
+        transient: false,
+      });
+    } catch (error) {
+      logger.error(
+        "UI",
+        "Failed to render markdown for assistant draft, falling back to plain text:",
+        error,
+      );
+      this.chat.updateMessage(id, {
+        role: "assistant",
+        content: `${content}`.trim(),
+        timestamp: Date.now(),
+        transient: false,
       });
     }
   }
@@ -171,6 +204,40 @@ export class UI {
 
   setStatus(text: string) {
     this.chat.setStatus(text);
+  }
+
+  setRuntimeInfo(text: string) {
+    this.chat.setRuntimeInfo(text);
+  }
+
+  setTheme(theme: ThemeName) {
+    this.chat.setTheme(theme);
+  }
+
+  showProgress(content: string): string {
+    return this.pushMessage({
+      role: "progress",
+      content,
+      timestamp: Date.now(),
+      transient: true,
+    });
+  }
+
+  updateMessage(id: string, patch: Partial<ChatMessage>) {
+    this.chat.updateMessage(id, patch);
+  }
+
+  removeMessage(id: string) {
+    this.chat.removeMessage(id);
+  }
+
+  startAssistantDraft(initialContent = ""): string {
+    return this.pushMessage({
+      role: "assistant",
+      content: initialContent,
+      timestamp: Date.now(),
+      transient: true,
+    });
   }
 
   setWatching(active: boolean) {

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "crypto";
+import * as os from "os";
 import { createInterface } from "readline";
 import { stripVTControlCharacters } from "util";
 import {
@@ -69,6 +70,22 @@ function getUniqueFileCount(events: ActivityEvent[]): number {
 
 function hashString(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
+}
+
+function shortenModelName(model: string): string {
+  return model.split("/").at(-1) ?? model;
+}
+
+function getCpuCoreCount(): number {
+  if (typeof os.availableParallelism === "function") {
+    return Math.max(1, os.availableParallelism());
+  }
+
+  return Math.max(1, os.cpus().length);
 }
 
 function mapToChatHistory(messages: StoredMessage[]): Array<{
@@ -237,13 +254,20 @@ async function main() {
     apiKey,
     frequencyLevel,
     personality,
+    thinkingEffort: store.getThinkingEffort(),
   });
   const watcher = new Watcher(projectPath);
-  const ui = new UI({ showPaneToggleHint: tmuxBootstrap.managed });
+  const ui = new UI({
+    showPaneToggleHint: tmuxBootstrap.managed,
+    theme: store.getTheme(),
+  });
   const tools = createChavesTools({ store });
   const indexer = new Indexer(projectPath, store, {
     maxFileSizeBytes: INDEX_MAX_FILE_SIZE,
     batchSize: 25,
+    onProgress(indexed, total) {
+      ui.setStatus(`Indexing... ${indexed}/${total}`);
+    },
   });
 
   let eventsSinceLastSummary = 0;
@@ -254,10 +278,63 @@ async function main() {
   let lastSummary = store.getLastSummary();
   let lastChatSummary = store.getLastChatSummary();
   let lastChatSummaryEndMessageId = lastChatSummary?.message_range_end ?? 0;
+  let lastCpuUsage = process.cpuUsage();
+  let lastCpuSampleAt = process.hrtime.bigint();
+  let latestRuntimeStats = {
+    cpuPercent: 0,
+    rssBytes: process.memoryUsage().rss,
+    heapUsedBytes: process.memoryUsage().heapUsed,
+  };
+
+  function refreshSummarizerConfig() {
+    summarizer.setModel(store.getModel());
+    summarizer.setThinkingEffort(store.getThinkingEffort());
+  }
+
+  function refreshUiPreferences() {
+    ui.setTheme(store.getTheme());
+  }
+
+  function sampleRuntimeStats() {
+    const memory = process.memoryUsage();
+    const now = process.hrtime.bigint();
+    const cpuDelta = process.cpuUsage(lastCpuUsage);
+    const elapsedMicros = Number(now - lastCpuSampleAt) / 1000;
+    const usageMicros = cpuDelta.user + cpuDelta.system;
+    const cpuPercent =
+      elapsedMicros > 0
+        ? (usageMicros / (elapsedMicros * getCpuCoreCount())) * 100
+        : 0;
+
+    lastCpuUsage = process.cpuUsage();
+    lastCpuSampleAt = now;
+    latestRuntimeStats = {
+      cpuPercent: Number.isFinite(cpuPercent) ? cpuPercent : 0,
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+    };
+  }
+
+  function updateRuntimeInfo() {
+    const model = shortenModelName(summarizer.getModel());
+    const thinking = summarizer.getThinkingEffort();
+    const runtimeInfo =
+      `model ${model} | think ${thinking} | rss ${formatMegabytes(latestRuntimeStats.rssBytes)} | cpu ${latestRuntimeStats.cpuPercent.toFixed(1)}%`;
+    ui.setRuntimeInfo(runtimeInfo);
+  }
 
   logger.debug("APP", `Last summarized event ID: ${lastSummarizedEventId}`);
 
   ui.showWelcome(projectPath);
+  refreshSummarizerConfig();
+  refreshUiPreferences();
+  sampleRuntimeStats();
+  updateRuntimeInfo();
+
+  const runtimeStatsInterval = setInterval(() => {
+    sampleRuntimeStats();
+    updateRuntimeInfo();
+  }, 1000);
 
   if (tmuxBootstrap.managed) {
     ui.showSuccess(`Dev terminal attached on the right (Ctrl+L to switch pane)`);
@@ -273,9 +350,17 @@ async function main() {
 
   if (INDEX_ON_START) {
     void (async () => {
+      const forceReindex = process.env.CHAVES_FORCE_REINDEX === "true";
+      const existingCount = store.getIndexedFileCount();
+
+      if (existingCount > 0 && !forceReindex) {
+        ui.showInfo(`Using ${existingCount} indexed files (CHAVES_FORCE_REINDEX=true to rebuild)`);
+        return;
+      }
+
       ui.setWatching(false);
       ui.setStatus("Indexing...");
-      ui.showInfo("Indexing codebase (one-time)...");
+      ui.showInfo(forceReindex ? "Re-indexing codebase..." : "Indexing codebase...");
       try {
         const result = await indexer.indexProject();
         ui.showSuccess(
@@ -338,7 +423,12 @@ async function main() {
     ui.setStatus("Thinking...");
 
     try {
-      const slashOutput = handleSlashCommand(text, store);
+      const slashOutput = handleSlashCommand(text, store, {
+        runtimeStats: latestRuntimeStats,
+      });
+      refreshSummarizerConfig();
+      refreshUiPreferences();
+      updateRuntimeInfo();
       if (slashOutput) {
         if (slashOutput.effect === "clear_context") {
           lastSummarizedEventId = 0;
@@ -378,6 +468,10 @@ async function main() {
 
       const fallbackContext = buildFallbackContext(store, text);
       const userIntent = buildUserIntentContext(store);
+      const progressId = ui.showProgress("Thinking...");
+      const draftId = ui.startAssistantDraft("");
+      let streamedReply = "";
+      let hasStreamedText = false;
       const reply = await summarizer.generateChat({
         userMessage: text,
         previousSummary: lastSummary?.content,
@@ -386,9 +480,33 @@ async function main() {
         recentMessages: mapToChatHistory(recentChatMessages),
         tools,
         fallbackContext,
+        onStatus: async (status) => {
+          ui.updateMessage(progressId, {
+            content: status,
+            timestamp: Date.now(),
+          });
+        },
+        onTextDelta: async (delta) => {
+          streamedReply += delta;
+          hasStreamedText = true;
+          ui.setStatus("Streaming...");
+          ui.updateMessage(progressId, {
+            content: "Streaming response...",
+            timestamp: Date.now(),
+          });
+          ui.updateMessage(draftId, {
+            content: streamedReply,
+            timestamp: Date.now(),
+          });
+        },
       });
 
-      await ui.showAssistantMessage(reply);
+      await ui.finalizeAssistantDraft(draftId, hasStreamedText ? streamedReply : reply);
+      ui.updateMessage(progressId, {
+        content: "Response ready.",
+        timestamp: Date.now(),
+        transient: false,
+      });
       store.addMessage({
         role: "assistant",
         channel: "chat",
@@ -612,6 +730,7 @@ async function main() {
   function cleanup() {
     if (cleanedUp) return;
     cleanedUp = true;
+    clearInterval(runtimeStatsInterval);
     watcher.stop();
     ui.destroy();
     if (isInsideManagedTmuxSession()) {
@@ -643,5 +762,9 @@ async function main() {
 
 main().catch((error) => {
   logger.error("APP", "Failed to start:", error);
+  const message = error instanceof Error
+    ? `${error.message}${error.stack ? "\n" + error.stack : ""}`
+    : String(error);
+  process.stderr.write(`[chaves] Fatal: ${message}\n`);
   process.exit(1);
 });

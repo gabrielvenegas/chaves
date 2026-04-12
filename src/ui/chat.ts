@@ -1,16 +1,19 @@
 import { createRequire } from "module";
 import type { ChatCommandDefinition } from "../chatCommands.js";
+import { logger } from "../logger.js";
+import { THEMES, type ThemeDefinition, type ThemeName } from "../theme.js";
 
 const require = createRequire(import.meta.url);
 const blessed = require("blessed");
-import { logger } from "../logger.js";
 
-export type ChatMessageRole = "user" | "assistant" | "system";
+export type ChatMessageRole = "user" | "assistant" | "system" | "progress";
 
 export interface ChatMessage {
+  id?: string;
   role: ChatMessageRole;
   content: string;
   timestamp?: number;
+  transient?: boolean;
 }
 
 export interface ChatUIOptions {
@@ -19,45 +22,26 @@ export interface ChatUIOptions {
   statusIntervalMs?: number;
   commandHints?: readonly string[];
   commands?: readonly ChatCommandDefinition[];
+  theme?: ThemeName;
 }
 
 export interface ChatUI {
   onSubmit(handler: (text: string) => void): void;
-  pushMessage(message: ChatMessage): void;
+  pushMessage(message: ChatMessage): string;
+  updateMessage(id: string, patch: Partial<ChatMessage>): void;
+  removeMessage(id: string): void;
   pushLog(stream: "stdout" | "stderr", data: string): void;
   clearMessages(): void;
   setStatus(text: string): void;
+  setRuntimeInfo(text: string): void;
+  setTheme(themeName: ThemeName): void;
   startWatchingIndicator(): void;
   stopWatchingIndicator(): void;
   focusInput(): void;
   destroy(): void;
 }
 
-const DEFAULT_STATUS_FRAMES = [
-  "⠋",
-  "⠙",
-  "⠹",
-  "⠸",
-  "⠼",
-  "⠴",
-  "⠦",
-  "⠧",
-  "⠇",
-  "⠏",
-];
-
-const PALETTE = {
-  background: "#1f1d1c",
-  panel: "#262220",
-  border: "#5a4a3d",
-  muted: "#8f7d6d",
-  text: "#f1ddbf",
-  user: "#b39c88",
-  assistant: "#f4bc69",
-  system: "#c8d35a",
-  status: "#ff9b3d",
-  track: "#312a26",
-};
+const DEFAULT_STATUS_FRAMES = ["o", "O", "0", "O"];
 
 function escapeTags(text: string): string {
   const helper = (blessed as any).helpers?.escape;
@@ -67,7 +51,57 @@ function escapeTags(text: string): string {
   return text.replace(/\{/g, "\\{").replace(/\}/g, "\\}");
 }
 
+function createId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function wrapWithWidth(text: string, width: number): string {
+  if (width <= 1) return text;
+
+  const lines = text.split("\n");
+  const output: string[] = [];
+
+  for (const line of lines) {
+    const visible = line.replace(/\{[^}]+\}/g, "");
+    if (visible.length <= width) {
+      output.push(line);
+      continue;
+    }
+
+    let rawLine = line;
+    while (rawLine.replace(/\{[^}]+\}/g, "").length > width) {
+      let visibleCount = 0;
+      let splitIndex = rawLine.length;
+
+      for (let i = 0; i < rawLine.length; i++) {
+        if (rawLine[i] === "{") {
+          const end = rawLine.indexOf("}", i);
+          if (end !== -1) {
+            i = end;
+            continue;
+          }
+        }
+
+        visibleCount += 1;
+        if (visibleCount >= width) {
+          splitIndex = i + 1;
+          break;
+        }
+      }
+
+      output.push(rawLine.slice(0, splitIndex));
+      rawLine = rawLine.slice(splitIndex);
+    }
+
+    output.push(rawLine);
+  }
+
+  return output.join("\n");
+}
+
 export function createChatUI(options: ChatUIOptions = {}): ChatUI {
+  let theme = THEMES[options.theme ?? "warm"];
+
   const screen = blessed.screen({
     smartCSR: true,
     title: options.title ?? "CHAVES",
@@ -81,22 +115,33 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     right: 0,
     bottom: 0,
     border: "line",
-    style: {
-      bg: PALETTE.panel,
-      border: { fg: PALETTE.border },
-    },
   });
 
   const header = blessed.box({
     top: 0,
     height: 1,
     left: 0,
-    right: 0,
-    content: ` ☕ CHAVES `,
-    style: {
-      fg: PALETTE.text,
-      bg: PALETTE.panel,
-    },
+    width: 14,
+    content: " CHAVES ",
+  });
+
+  const activity = blessed.box({
+    top: 0,
+    height: 1,
+    left: 15,
+    width: 22,
+    tags: true,
+    content: "",
+  });
+
+  const runtime = blessed.box({
+    top: 0,
+    height: 1,
+    left: 38,
+    right: 1,
+    align: "right",
+    tags: true,
+    content: "",
   });
 
   const headerDivider = blessed.line({
@@ -105,76 +150,34 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     right: 0,
     orientation: "horizontal",
     type: "line",
-    style: {
-      fg: PALETTE.border,
-      bg: PALETTE.panel,
-    },
   });
 
-  const status = blessed.box({
-    top: 0,
-    height: 1,
-    right: 0,
-    width: 28,
-    align: "right",
-    tags: true,
-    content: escapeTags(options.initialStatus ?? "Watching..."),
-    style: {
-      fg: PALETTE.status,
-      bg: PALETTE.panel,
-    },
-  });
-
-  const transcript = blessed.log({
+  const transcript = blessed.box({
     top: 2,
     left: 0,
     right: 0,
-    bottom: 4,
+    bottom: 5,
     tags: true,
     keys: true,
     vi: true,
     mouse: true,
-    alwaysScroll: true,
     scrollable: true,
+    alwaysScroll: true,
     padding: {
       top: 1,
       left: 1,
       right: 1,
+      bottom: 1,
     },
     scrollbar: {
       ch: " ",
-      track: {
-        bg: PALETTE.track,
-      },
-      style: {
-        bg: PALETTE.border,
-      },
-    },
-    style: {
-      fg: PALETTE.text,
-      bg: PALETTE.background,
-    },
-  });
-
-  const input = blessed.box({
-    bottom: 0,
-    height: 3,
-    left: 0,
-    right: 0,
-    border: "line",
-    label: " You ",
-    tags: true,
-    keys: true,
-    mouse: true,
-    style: {
-      fg: PALETTE.text,
-      bg: PALETTE.panel,
-      border: { fg: PALETTE.border },
+      track: { bg: theme.track },
+      style: { bg: theme.border },
     },
   });
 
   const commandMenu = blessed.box({
-    bottom: 4,
+    bottom: 5,
     height: 0,
     left: 0,
     right: 0,
@@ -182,15 +185,10 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     border: "line",
     label: " Commands ",
     tags: true,
-    style: {
-      fg: PALETTE.text,
-      bg: PALETTE.panel,
-      border: { fg: PALETTE.border },
-    },
   });
 
   const commandBar = blessed.box({
-    bottom: 3,
+    bottom: 4,
     height: 1,
     left: 1,
     right: 1,
@@ -199,16 +197,24 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       options.commandHints && options.commandHints.length > 0
         ? `{gray-fg}Commands:{/gray-fg} ${options.commandHints.join("  ")}`
         : "",
-    style: {
-      fg: PALETTE.muted,
-      bg: PALETTE.panel,
-    },
+  });
+
+  const input = blessed.box({
+    bottom: 0,
+    height: 4,
+    left: 0,
+    right: 0,
+    border: "line",
+    label: " Compose ",
+    tags: true,
+    mouse: true,
   });
 
   screen.append(frame);
   frame.append(header);
+  frame.append(activity);
+  frame.append(runtime);
   frame.append(headerDivider);
-  frame.append(status);
   frame.append(transcript);
   frame.append(commandMenu);
   frame.append(commandBar);
@@ -220,51 +226,112 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   let inputValue = "";
   let cursorIndex = 0;
   let commandMenuHeight = 0;
+  let statusText = options.initialStatus ?? "Watching";
 
-  // Message buffer — needed to re-render transcript when width changes on resize
   const messageBuffer: ChatMessage[] = [];
 
-  function rerenderTranscript() {
-    // Do NOT use add() here — after setContent(""), blessed's _clines.fake is
-    // undefined until the next render(), so every add() overwrites line 0.
-    // Build the full string and hand it to setContent() in one shot instead.
-    const full = messageBuffer.map(renderMessage).join("");
-    transcript.setContent(full);
-    transcript.setScrollPerc(100);
+  function applyTheme() {
+    frame.style = {
+      bg: theme.panel,
+      border: { fg: theme.border },
+    };
+    header.style = {
+      fg: theme.text,
+      bg: theme.panel,
+      bold: true,
+    };
+    activity.style = {
+      fg: theme.status,
+      bg: theme.panel,
+      bold: true,
+    };
+    runtime.style = {
+      fg: theme.muted,
+      bg: theme.panel,
+    };
+    // blessed.line sets style.border = style (self-ref) in its constructor.
+    // Replacing the whole object would sever that link and crash sattr.
+    headerDivider.style.fg = theme.border;
+    headerDivider.style.bg = theme.panel;
+    transcript.style = {
+      fg: theme.text,
+      bg: theme.background,
+    };
+    transcript.scrollbar.track.bg = theme.track;
+    transcript.scrollbar.style.bg = theme.border;
+    commandMenu.style = {
+      fg: theme.text,
+      bg: theme.panelAlt,
+      border: { fg: theme.border },
+    };
+    commandBar.style = {
+      fg: theme.muted,
+      bg: theme.panel,
+    };
+    input.style = {
+      fg: theme.text,
+      bg: theme.panelAlt,
+      border: { fg: theme.border },
+    };
   }
 
-  function scrollTranscript(lines: number) {
-    transcript.scroll(lines);
-    screen.render();
-  }
-
-  function renderMessage(msg: ChatMessage): string {
-    const time = msg.timestamp
-      ? new Date(msg.timestamp).toLocaleTimeString()
+  function renderMessage(message: ChatMessage): string {
+    const time = message.timestamp
+      ? new Date(message.timestamp).toLocaleTimeString()
       : "";
-    const timePrefix = time ? `{#8f7d6d-fg}${time}{/} ` : "";
-    // Assistant content is pre-rendered blessed tags by MarkdownRenderer.
-    // User and system content is plain text and must be escaped.
-    const safeContent = msg.role === "assistant"
-      ? msg.content
-      : escapeTags(msg.content);
-    if (msg.role === "user") {
-      return `${timePrefix}{#b39c88-fg}{bold}YOU:{/bold}{/} ${safeContent}\n`;
-    }
-    if (msg.role === "assistant") {
-      return `${timePrefix}{#f4bc69-fg}{bold}CHAVES:{/bold}{/} ${safeContent}\n`;
-    }
-    return `${timePrefix}{#c8d35a-fg}{bold}SYSTEM:{/bold}{/} ${safeContent}\n`;
+    const body = message.content;
+    const safeBody =
+      message.role === "assistant" && !message.transient
+        ? body
+        : escapeTags(body);
+
+    const colors: Record<ChatMessageRole, string> = {
+      user: theme.user,
+      assistant: theme.assistant,
+      system: theme.system,
+      progress: theme.progress,
+    };
+
+    const labels: Record<ChatMessageRole, string> = {
+      user: "YOU",
+      assistant: "CHAVES",
+      system: "SYSTEM",
+      progress: "STATUS",
+    };
+
+    const width = Math.max(24, Number(transcript.width ?? screen.width) - 8);
+    const wrapped = wrapWithWidth(safeBody, width);
+    const lines = wrapped.split("\n");
+    const block = [
+      `{${colors[message.role]}-fg}{bold}${labels[message.role]}{/bold}{/} {${theme.muted}-fg}${time}{/}`,
+      ...lines.map((line) => `  ${line}`),
+    ];
+
+    return `${block.join("\n")}\n\n`;
   }
 
-  function onSubmit(handler: (text: string) => void) {
-    submitHandler = handler;
+  function rerenderTranscript() {
+    transcript.setContent(messageBuffer.map(renderMessage).join("").trimEnd());
+    transcript.setScrollPerc(100);
   }
 
   function getInputInnerWidth(): number {
     const measuredWidth =
       typeof input.width === "number" ? input.width : screen.width;
-    return Math.max(1, measuredWidth - 3);
+    return Math.max(1, measuredWidth - 6);
+  }
+
+  function placeCaret(relativeCursor: number) {
+    const lpos = input.lpos;
+    if (!lpos) {
+      screen.program.hideCursor();
+      return;
+    }
+
+    const x = lpos.xi + 2 + relativeCursor;
+    const y = lpos.yi + 1;
+    screen.program.showCursor();
+    screen.program.cup(y, x);
   }
 
   function renderInput() {
@@ -272,9 +339,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
 
     if (!inputValue) {
       input.setContent(
-        `{#8f7d6d-fg}Ask Chaves anything...{/}  {#5a4a3d-fg}"/" for commands{/}`,
+        `{${theme.cursor}-fg}{inverse} {/inverse}{/} {${theme.muted}-fg}Ask Chaves anything...{/}  {${theme.border}-fg}"/" for commands{/}`,
       );
-      return;
+      return 0;
     }
 
     const start = Math.max(0, cursorIndex - width + 1);
@@ -287,8 +354,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       : escapeTags(visible.slice(relativeCursor + 1));
 
     input.setContent(
-      `${before}{inverse}${escapeTags(cursorChar)}{/inverse}${after}`,
+      `${before}{${theme.cursor}-fg}{inverse}${escapeTags(cursorChar)}{/inverse}{/}${after}`,
     );
+    return relativeCursor;
   }
 
   function getCommandMatches(): readonly ChatCommandDefinition[] {
@@ -306,11 +374,8 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   }
 
   function updateLayout(forceRerender = false) {
-    transcript.top = 2;
-    transcript.left = 0;
-    transcript.right = 0;
-    transcript.bottom = 4 + commandMenuHeight;
-    commandMenu.bottom = 4;
+    transcript.bottom = 5 + commandMenuHeight;
+    commandMenu.bottom = 5;
 
     if (forceRerender) {
       rerenderTranscript();
@@ -333,7 +398,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       visibleMatches
         .map(
           (entry) =>
-            `{#f4bc69-fg}${escapeTags(entry.command)}{/} {#8f7d6d-fg}-{/} ${escapeTags(entry.description)}`,
+            `{${theme.assistant}-fg}${escapeTags(entry.command)}{/} {${theme.muted}-fg}-{/} ${escapeTags(entry.description)}`,
         )
         .join("\n"),
     );
@@ -342,10 +407,107 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   }
 
   function renderInputArea() {
-    renderInput();
+    const relativeCursor = renderInput();
     renderCommandMenu();
-    screen.program.hideCursor();
     screen.render();
+    placeCaret(relativeCursor);
+  }
+
+  function focusInput() {
+    input.focus();
+    renderInputArea();
+  }
+
+  function scrollTranscript(lines: number) {
+    transcript.scroll(lines);
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function setStatus(text: string) {
+    statusText = text;
+    activity.setContent(` {${theme.status}-fg}${escapeTags(statusText)}{/} `);
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function startWatchingIndicator() {
+    if (statusTimer) return;
+    const interval = options.statusIntervalMs ?? 220;
+    statusTimer = setInterval(() => {
+      const frameChar =
+        DEFAULT_STATUS_FRAMES[statusIndex % DEFAULT_STATUS_FRAMES.length];
+      statusIndex += 1;
+      activity.setContent(
+        ` {${theme.status}-fg}${frameChar}{/} {${theme.status}-fg}${escapeTags(statusText)}{/}`,
+      );
+      screen.render();
+      placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+    }, interval);
+  }
+
+  function stopWatchingIndicator() {
+    if (!statusTimer) return;
+    clearInterval(statusTimer);
+    statusTimer = null;
+    setStatus(statusText);
+  }
+
+  function setRuntimeInfo(text: string) {
+    runtime.setContent(escapeTags(text));
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function pushMessage(message: ChatMessage): string {
+    const id = message.id ?? createId();
+    messageBuffer.push({
+      ...message,
+      id,
+      timestamp: message.timestamp ?? Date.now(),
+    });
+    rerenderTranscript();
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+    return id;
+  }
+
+  function updateMessage(id: string, patch: Partial<ChatMessage>) {
+    const index = messageBuffer.findIndex((message) => message.id === id);
+    if (index === -1) return;
+    const current = messageBuffer[index];
+    if (!current) return;
+    messageBuffer[index] = {
+      ...current,
+      ...patch,
+      role: patch.role ?? current.role,
+      content: patch.content ?? current.content,
+    };
+    rerenderTranscript();
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function removeMessage(id: string) {
+    const index = messageBuffer.findIndex((message) => message.id === id);
+    if (index === -1) return;
+    messageBuffer.splice(index, 1);
+    rerenderTranscript();
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function clearMessages() {
+    messageBuffer.length = 0;
+    transcript.setContent("");
+    transcript.setScrollPerc(0);
+    screen.render();
+    placeCaret(Math.min(cursorIndex, getInputInnerWidth() - 1));
+  }
+
+  function pushLog(stream: "stdout" | "stderr", data: string) {
+    void stream;
+    void data;
   }
 
   function clearInput() {
@@ -357,9 +519,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   function submitInput() {
     const text = inputValue.trim();
     clearInput();
-
     if (!text) return;
-
     logger.debug("UI", "User submitted input");
     submitHandler?.(text);
   }
@@ -393,18 +553,26 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       meta?: boolean;
       name?: string;
       sequence?: string;
-      full?: string;
     },
   ): boolean {
     if (key.ctrl || key.meta || !ch) return false;
     if (key.name === "mouse") return false;
     if (key.sequence && key.sequence !== ch) return false;
     if (/[\x00-\x1f\x7f]/.test(ch)) return false;
-
-    // Rule: only plain printable keyboard text may enter the input buffer.
-    // Raw terminal escape sequences, including mouse reporting, must never be
-    // inserted here again.
     return Array.from(ch).length >= 1;
+  }
+
+  function setTheme(themeName: ThemeName) {
+    theme = THEMES[themeName];
+    applyTheme();
+    renderCommandMenu();
+    rerenderTranscript();
+    renderInputArea();
+    setStatus(statusText);
+  }
+
+  function onSubmit(handler: (text: string) => void) {
+    submitHandler = handler;
   }
 
   screen.key(["C-c"], () => {
@@ -412,15 +580,11 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   });
 
   screen.key(["pageup"], () => {
-    scrollTranscript(
-      -Math.max(1, Math.floor((transcript.height as number) / 2)),
-    );
+    scrollTranscript(-Math.max(1, Math.floor(Number(transcript.height ?? 10) / 2)));
   });
 
   screen.key(["pagedown"], () => {
-    scrollTranscript(
-      Math.max(1, Math.floor((transcript.height as number) / 2)),
-    );
+    scrollTranscript(Math.max(1, Math.floor(Number(transcript.height ?? 10) / 2)));
   });
 
   screen.key(["up"], () => {
@@ -439,19 +603,17 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     renderInputArea();
   });
 
-  input.on("click", () => {
-    focusInput();
+  [frame, header, activity, runtime, transcript, commandBar, input].forEach((node) => {
+    node.on("click", () => {
+      focusInput();
+    });
   });
 
-  // Keep typing scoped to the input widget. Do not move this back to a global
-  // screen-level keypress handler: that makes it too easy for raw terminal and
-  // mouse-reporting escape sequences to leak into the input buffer.
-  input.on("keypress", (ch: string, key: {
+  screen.on("keypress", (ch: string, key: {
     ctrl?: boolean;
     meta?: boolean;
     name?: string;
     sequence?: string;
-    full?: string;
   }) => {
     if (key.ctrl && (key.name === "c" || key.name === "l")) return;
 
@@ -482,8 +644,6 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
         renderInputArea();
         return;
       case "tab":
-      case "pageup":
-      case "pagedown":
       case "escape":
         return;
       default:
@@ -494,73 +654,28 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     insertText(ch);
   });
 
-  function pushMessage(message: ChatMessage) {
-    messageBuffer.push(message);
-    transcript.add(renderMessage(message));
-    transcript.setScrollPerc(100);
-    screen.render();
-  }
-
-  function pushLog(stream: "stdout" | "stderr", data: string) {
-    void stream;
-    void data;
-  }
-
-  function clearMessages() {
-    messageBuffer.length = 0;
-    transcript.setContent("");
-    transcript.setScrollPerc(0);
-    screen.render();
-  }
-
-  function setStatus(text: string) {
-    status.setContent(escapeTags(text));
-    screen.render();
-  }
-
-  function startWatchingIndicator() {
-    if (statusTimer) return;
-    const interval = options.statusIntervalMs ?? 120;
-    statusTimer = setInterval(() => {
-      const frame =
-        DEFAULT_STATUS_FRAMES[statusIndex % DEFAULT_STATUS_FRAMES.length];
-      statusIndex += 1;
-      status.setContent(`${frame} Watching...`);
-      screen.render();
-    }, interval);
-  }
-
-  function stopWatchingIndicator() {
-    if (!statusTimer) return;
-    clearInterval(statusTimer);
-    statusTimer = null;
-    status.setContent("Watching...");
-    screen.render();
-  }
-
-  function focusInput() {
-    input.focus();
-    renderInputArea();
-  }
-
-  function destroy() {
-    if (statusTimer) clearInterval(statusTimer);
-    screen.program.hideCursor();
-    screen.destroy();
-  }
-
+  applyTheme();
   updateLayout();
+  setStatus(statusText);
   focusInput();
 
   return {
     onSubmit,
     pushMessage,
+    updateMessage,
+    removeMessage,
     pushLog,
     clearMessages,
     setStatus,
+    setRuntimeInfo,
+    setTheme,
     startWatchingIndicator,
     stopWatchingIndicator,
     focusInput,
-    destroy,
+    destroy() {
+      if (statusTimer) clearInterval(statusTimer);
+      screen.program.hideCursor();
+      screen.destroy();
+    },
   };
 }

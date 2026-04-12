@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 import { logger } from "./logger.js";
 import { shield } from "./shield.js";
 import type { ActivityEvent, StoredMessage } from "./store.js";
@@ -8,6 +8,7 @@ type ChatRole = "user" | "assistant" | "system";
 
 export type MessageFrequencyLevel = 1 | 2 | 3;
 export type Personality = "technical" | "collaborative" | "creative";
+export type ThinkingEffort = "low" | "medium" | "high";
 
 export interface ChatHistoryMessage {
   role: ChatRole;
@@ -22,6 +23,8 @@ interface GenerateChatInput {
   recentMessages?: ChatHistoryMessage[];
   tools?: Record<string, unknown>;
   fallbackContext?: string;
+  onTextDelta?: (delta: string) => void | Promise<void>;
+  onStatus?: (status: string) => void | Promise<void>;
 }
 
 export interface SummarizerOptions {
@@ -30,6 +33,7 @@ export interface SummarizerOptions {
   apiKey?: string;
   frequencyLevel?: MessageFrequencyLevel;
   personality?: Personality;
+  thinkingEffort?: ThinkingEffort;
 }
 
 export class Summarizer {
@@ -39,6 +43,7 @@ export class Summarizer {
   private apiKey?: string;
   private frequencyLevel: MessageFrequencyLevel;
   private personality: Personality;
+  private thinkingEffort: ThinkingEffort;
 
   constructor(options: SummarizerOptions = {}) {
     this.model = options.model ?? "anthropic/claude-3.5-haiku";
@@ -46,6 +51,7 @@ export class Summarizer {
     this.apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
     this.frequencyLevel = options.frequencyLevel ?? 2;
     this.personality = options.personality ?? "collaborative";
+    this.thinkingEffort = options.thinkingEffort ?? "medium";
 
     logger.debug("AI", "Initializing OpenRouter client");
     this.client = createOpenAI({
@@ -55,10 +61,29 @@ export class Summarizer {
     logger.debug("AI", "OpenRouter client initialized");
     logger.debug("AI", `Using model: ${this.model}`);
     logger.debug("AI", `Using language: ${this.language}`);
+    logger.debug("AI", `Using thinking effort: ${this.thinkingEffort}`);
 
     if (!this.apiKey) {
       logger.warn("AI", "OPENROUTER_API_KEY not set - AI features will fail");
     }
+  }
+
+  getModel(): string {
+    return this.model;
+  }
+
+  setModel(model: string) {
+    this.model = model.trim() || "anthropic/claude-3.5-haiku";
+    logger.debug("AI", `Model updated: ${this.model}`);
+  }
+
+  getThinkingEffort(): ThinkingEffort {
+    return this.thinkingEffort;
+  }
+
+  setThinkingEffort(effort: ThinkingEffort) {
+    this.thinkingEffort = effort;
+    logger.debug("AI", `Thinking effort updated: ${this.thinkingEffort}`);
   }
 
   async generateSummary(
@@ -104,6 +129,7 @@ export class Summarizer {
         maxTokens: maxTokensByLevel[this.frequencyLevel],
         system,
         prompt,
+        providerOptions: this.buildProviderOptions(),
       });
 
       logger.aiResponse(text.length);
@@ -212,6 +238,8 @@ export class Summarizer {
         system,
         messages,
         tools: input.tools,
+        onTextDelta: input.onTextDelta,
+        onStatus: input.onStatus,
       });
     } catch (error) {
       if (!input.tools) throw error;
@@ -234,6 +262,8 @@ export class Summarizer {
       return this.generateChatCompletion({
         system,
         messages: fallbackMessages,
+        onTextDelta: input.onTextDelta,
+        onStatus: input.onStatus,
       });
     }
   }
@@ -271,6 +301,7 @@ export class Summarizer {
       system,
       prompt,
       maxTokens: 320,
+      providerOptions: this.buildProviderOptions(),
     });
 
     if (text.trim().length === 0) {
@@ -285,6 +316,8 @@ export class Summarizer {
     system: string;
     messages: Array<{ role: ChatRole; content: string }>;
     tools?: Record<string, unknown>;
+    onTextDelta?: (delta: string) => void | Promise<void>;
+    onStatus?: (status: string) => void | Promise<void>;
   }): Promise<string> {
     const toolEnabled = Boolean(input.tools);
 
@@ -294,7 +327,7 @@ export class Summarizer {
       3: 3600,
     };
 
-    const response = await generateText({
+    const response = streamText({
       model: this.client(this.model),
       system: input.system,
       messages: input.messages.map((message) => ({
@@ -305,8 +338,21 @@ export class Summarizer {
       toolChoice: toolEnabled ? "auto" : undefined,
       maxSteps: toolEnabled ? 5 : undefined,
       maxTokens: maxTokensByLevel[this.frequencyLevel],
+      providerOptions: this.buildProviderOptions(),
+      onChunk: input.onTextDelta
+        ? async ({ chunk }) => {
+            if (chunk.type === "text-delta") {
+              await input.onTextDelta?.(chunk.textDelta);
+            }
+          }
+        : undefined,
       onStepFinish: toolEnabled
-        ? (step) => {
+        ? async (step) => {
+            if ((step.toolCalls?.length ?? 0) > 0) {
+              await input.onStatus?.("Calling tools...");
+            } else {
+              await input.onStatus?.("Thinking...");
+            }
             logger.debug("AI", "Chat step finished", {
               finishReason: step.finishReason,
               toolCalls: step.toolCalls?.length ?? 0,
@@ -316,12 +362,14 @@ export class Summarizer {
         : undefined,
     });
 
-    if (response.text.trim().length === 0) {
+    const text = await response.text;
+
+    if (text.trim().length === 0) {
       throw new Error("Empty response returned from AI provider");
     }
 
-    logger.aiResponse(response.text.length);
-    return response.text;
+    logger.aiResponse(text.length);
+    return text;
   }
 
   private buildSummarySystemPrompt(): string {
@@ -337,6 +385,14 @@ export class Summarizer {
       "If explicit user guidance conflicts with inferred activity, explicit user guidance wins.",
       "Be grounded in the provided context. Do not claim actions were taken unless explicitly stated.",
     ].join("\n");
+  }
+
+  private buildProviderOptions(): Record<string, Record<string, string>> {
+    return {
+      openai: {
+        reasoningEffort: this.thinkingEffort,
+      },
+    };
   }
 
   private buildChatSystemPrompt(): string {

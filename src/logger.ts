@@ -69,7 +69,9 @@ export class Logger {
     }
 
     if (data !== undefined && level !== LogLevel.INFO) {
-      if (typeof data === "object") {
+      if (data instanceof Error) {
+        output += "\n" + chalk.dim(`${data.message}${data.stack ? "\n" + data.stack : ""}`);
+      } else if (typeof data === "object") {
         output += "\n" + chalk.dim(JSON.stringify(data, null, 2));
       } else {
         output += " " + chalk.dim(String(data));

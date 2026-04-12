@@ -8,6 +8,7 @@ import { Store } from "./store.js";
 export interface IndexerOptions {
   maxFileSizeBytes: number;
   batchSize?: number;
+  onProgress?: (indexed: number, total: number) => void;
 }
 
 export interface IndexerResult {
@@ -32,6 +33,7 @@ export class Indexer {
     let indexedFiles = 0;
     let blockedFiles = 0;
     let skippedFiles = 0;
+    let processed = 0;
 
     logger.debug("INDEXER", `Collected ${filePaths.length} files to index`);
 
@@ -82,6 +84,9 @@ export class Indexer {
           language: detectLanguage(relativePath),
           sizeBytes: fileStats.size,
         });
+
+        processed++;
+        this.options.onProgress?.(processed, filePaths.length);
       }
 
       await new Promise<void>((resolve) => {

@@ -1,10 +1,17 @@
 import { createHash } from "crypto";
 import { spawnSync } from "child_process";
+import { mkdirSync, rmSync } from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
 import { logger } from "./logger.js";
 
 const TMUX_BINARY = "tmux";
 const TMUX_SESSION_NAME = "chaves";
 const DEFAULT_LOGIN_SHELL = "/bin/zsh";
+const ENTRY_SCRIPT_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "./index.ts",
+);
 
 export interface TmuxBootstrapContext {
   projectPath: string;
@@ -26,7 +33,7 @@ function buildCommand(argv: string[]): string {
 }
 
 function runTmux(
-  socketName: string,
+  socketPath: string,
   args: string[],
   {
     inheritStdio = false,
@@ -34,7 +41,7 @@ function runTmux(
 ): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(
     TMUX_BINARY,
-    ["-L", socketName, ...args],
+    ["-S", socketPath, ...args],
     {
       encoding: "utf8",
       stdio: inheritStdio ? "inherit" : "pipe",
@@ -49,12 +56,12 @@ function runTmux(
 }
 
 function runTmuxChecked(
-  socketName: string,
+  socketPath: string,
   args: string[],
   step: string,
   options?: { inheritStdio?: boolean },
 ): string {
-  const result = runTmux(socketName, args, options);
+  const result = runTmux(socketPath, args, options);
   if (result.status !== 0) {
     throw new Error(
       result.stderr || `tmux command failed during ${step}: ${args.join(" ")}`,
@@ -72,7 +79,13 @@ export function ensureTmuxAvailable(): boolean {
 }
 
 export function buildManagedSocketName(projectPath: string): string {
-  return `chaves-${createHash("sha1").update(projectPath).digest("hex").slice(0, 10)}`;
+  return `chaves-${createHash("sha1").update(projectPath).digest("hex").slice(0, 10)}.sock`;
+}
+
+export function buildManagedSocketPath(projectPath: string): string {
+  const baseDir = resolve("/tmp", "chaves-tmux");
+  mkdirSync(baseDir, { recursive: true });
+  return resolve(baseDir, buildManagedSocketName(projectPath));
 }
 
 export function isInsideManagedTmuxSession(): boolean {
@@ -80,15 +93,15 @@ export function isInsideManagedTmuxSession(): boolean {
 }
 
 function buildBaseRuntimeArgv(): string[] {
-  return [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
-}
-
-function getEntryScriptArg(): string {
-  const scriptArg = process.argv[1];
-  if (!scriptArg) {
-    throw new Error("Unable to determine the CHAVES entry script for tmux mode.");
+  if (process.versions.bun) {
+    return [process.execPath, ENTRY_SCRIPT_PATH];
   }
-  return scriptArg;
+
+  // Use the tsx binary from chaves's own node_modules so the command works
+  // regardless of the target project's CWD (the target project won't have tsx).
+  const chavesRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const tsxBin = resolve(chavesRoot, "node_modules", ".bin", "tsx");
+  return [tsxBin, ENTRY_SCRIPT_PATH];
 }
 
 function buildEnvPrefix(env: Record<string, string>): string {
@@ -100,18 +113,19 @@ function buildEnvPrefix(env: Record<string, string>): string {
 
 export function buildChatPaneCommand({
   projectPath,
-  socketName,
+  socketPath,
 }: {
   projectPath: string;
-  socketName: string;
+  socketPath: string;
 }): string {
   const envPrefix = buildEnvPrefix({
     CHAVES_TMUX_MANAGED: "1",
-    CHAVES_TMUX_SOCKET: socketName,
+    CHAVES_TMUX_SOCKET: socketPath,
     CHAVES_TMUX_SESSION: TMUX_SESSION_NAME,
   });
-  const runtimeCommand = buildCommand(buildBaseRuntimeArgv());
-  return `cd ${shellQuote(projectPath)} && ${envPrefix} ${runtimeCommand}`;
+  // Pass projectPath as a positional arg; no cd needed (main() reads positionalArgs[0]).
+  const runtimeCommand = buildCommand([...buildBaseRuntimeArgv(), projectPath]);
+  return `${envPrefix} ${runtimeCommand}`;
 }
 
 export function buildRelayCommand({
@@ -123,13 +137,11 @@ export function buildRelayCommand({
     CHAVES_TMUX_MANAGED: "1",
   });
   const runtimeCommand = buildCommand([
-    process.execPath,
-    ...process.execArgv,
-    getEntryScriptArg(),
+    ...buildBaseRuntimeArgv(),
     "--tmux-relay",
     projectPath,
   ]);
-  return `cd ${shellQuote(projectPath)} && ${envPrefix} ${runtimeCommand}`;
+  return `${envPrefix} ${runtimeCommand}`;
 }
 
 export function buildDevPaneCommand({
@@ -151,22 +163,34 @@ export function buildDevPaneCommand({
   ].join("; ");
 }
 
-function hasManagedSession(socketName: string): boolean {
-  const result = runTmux(socketName, ["has-session", "-t", TMUX_SESSION_NAME]);
+function hasManagedSession(socketPath: string): boolean {
+  const result = runTmux(socketPath, ["has-session", "-t", TMUX_SESSION_NAME]);
   return result.status === 0;
 }
 
-function getPaneId(socketName: string, args: string[], step: string): string {
-  const paneId = runTmuxChecked(socketName, args, step);
+function resetManagedSession(socketPath: string): void {
+  if (hasManagedSession(socketPath)) {
+    runTmuxChecked(
+      socketPath,
+      ["kill-session", "-t", TMUX_SESSION_NAME],
+      "resetting existing managed session",
+    );
+  }
+
+  rmSync(socketPath, { force: true });
+}
+
+function getPaneId(socketPath: string, args: string[], step: string): string {
+  const paneId = runTmuxChecked(socketPath, args, step);
   if (!paneId) {
     throw new Error(`tmux did not return a pane id during ${step}`);
   }
   return paneId;
 }
 
-export function attachManagedSession(socketName: string): void {
+export function attachManagedSession(socketPath: string): void {
   logger.info("APP", "Attaching to tmux-managed split");
-  const result = runTmux(socketName, ["attach-session", "-t", TMUX_SESSION_NAME], {
+  const result = runTmux(socketPath, ["attach-session", "-t", TMUX_SESSION_NAME], {
     inheritStdio: true,
   });
 
@@ -175,25 +199,25 @@ export function attachManagedSession(socketName: string): void {
   }
 }
 
-export function enablePaneToggleBinding(socketName: string): void {
+export function enablePaneToggleBinding(socketPath: string): void {
   runTmuxChecked(
-    socketName,
+    socketPath,
     ["bind-key", "-n", "C-l", "last-pane"],
     "binding Ctrl+L",
   );
 }
 
 export function enablePaneOutputPipe({
-  socketName,
+  socketPath,
   paneId,
   relayCommand,
 }: {
-  socketName: string;
+  socketPath: string;
   paneId: string;
   relayCommand: string;
 }): void {
   runTmuxChecked(
-    socketName,
+    socketPath,
     ["pipe-pane", "-O", "-t", paneId, relayCommand],
     "enabling pane output pipe",
   );
@@ -203,18 +227,15 @@ export function startManagedSession({
   projectPath,
   devCommand,
 }: TmuxBootstrapContext): { socketName: string } {
-  const socketName = buildManagedSocketName(projectPath);
+  const socketPath = buildManagedSocketPath(projectPath);
+  resetManagedSession(socketPath);
 
-  if (hasManagedSession(socketName)) {
-    return { socketName };
-  }
-
-  const chatPaneCommand = buildChatPaneCommand({ projectPath, socketName });
+  const chatPaneCommand = buildChatPaneCommand({ projectPath, socketPath });
   const devPaneCommand = buildDevPaneCommand({ projectPath, devCommand });
   const relayCommand = buildRelayCommand({ projectPath });
 
   const chatPaneId = getPaneId(
-    socketName,
+    socketPath,
     [
       "new-session",
       "-d",
@@ -229,7 +250,7 @@ export function startManagedSession({
   );
 
   const devPaneId = getPaneId(
-    socketName,
+    socketPath,
     [
       "split-window",
       "-h",
@@ -243,13 +264,13 @@ export function startManagedSession({
     "creating dev pane",
   );
 
-  runTmuxChecked(socketName, ["set-option", "-g", "status", "off"], "disabling tmux status bar");
-  runTmuxChecked(socketName, ["select-layout", "-t", TMUX_SESSION_NAME, "even-horizontal"], "setting layout");
-  enablePaneToggleBinding(socketName);
-  enablePaneOutputPipe({ socketName, paneId: devPaneId, relayCommand });
-  runTmuxChecked(socketName, ["select-pane", "-t", chatPaneId], "focusing chat pane");
+  runTmuxChecked(socketPath, ["set-option", "-g", "status", "off"], "disabling tmux status bar");
+  runTmuxChecked(socketPath, ["select-layout", "-t", TMUX_SESSION_NAME, "even-horizontal"], "setting layout");
+  enablePaneToggleBinding(socketPath);
+  enablePaneOutputPipe({ socketPath, paneId: devPaneId, relayCommand });
+  runTmuxChecked(socketPath, ["select-pane", "-t", chatPaneId], "focusing chat pane");
 
-  return { socketName };
+  return { socketName: socketPath };
 }
 
 export function maybeBootstrapTmuxSession(
