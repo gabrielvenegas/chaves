@@ -96,6 +96,11 @@ export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
     usage: "/export",
     description: "Export the current conversation to a markdown file.",
   },
+  {
+    command: "/shortcuts",
+    usage: "/shortcuts",
+    description: "Show terminal keyboard shortcuts.",
+  },
 ] as const;
 
 export const PRIMARY_CHAT_COMMANDS = CHAT_COMMANDS.slice(0, 3).map((entry) =>
@@ -697,7 +702,8 @@ export async function handleSlashCommand(
       };
 
     case "/export": {
-      const messages = store.getRecentMessages({ limit: 10000, channel: "chat" });
+      // Get all messages from all channels
+      const messages = store.getRecentMessages({ limit: 10000 });
       if (messages.length === 0) return { output: "No conversation to export." };
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -709,10 +715,11 @@ export async function handleSlashCommand(
         `Date: ${new Date().toLocaleString()}`,
         `Model: ${store.getModel()}`,
         "",
-        ...messages.reverse().map((msg) => {
+        ...messages.map((msg) => {
           const role = msg.role.toUpperCase();
+          const channel = msg.channel.toUpperCase();
           const ts = new Date(msg.timestamp).toLocaleString();
-          return `### ${role} (${ts})\n\n${msg.content}\n\n---`;
+          return `### ${role} [${channel}] (${ts})\n\n${msg.content}\n\n---`;
         }),
       ].join("\n");
 
@@ -725,6 +732,27 @@ export async function handleSlashCommand(
         };
       }
     }
+
+    case "/shortcuts":
+      return {
+        output: [
+          "Keyboard Shortcuts:",
+          "",
+          "Navigation:",
+          "- Ctrl+L: Toggle between AI Chat and Dev Pane",
+          "- PageUp/PageDown: Scroll message history",
+          "- Esc: Jump to bottom / Clear unread badge",
+          "",
+          "Editor:",
+          "- Ctrl+K: Clear current chat input",
+          "- Ctrl+R: Force re-index codebase",
+          "- Alt+Enter: Insert newline without submitting",
+          "",
+          "UI:",
+          "- Ctrl+T: Cycle through themes (warm, slate, forest)",
+          "- Ctrl+C: Quit CHAVES",
+        ].join("\n"),
+      };
 
     default:
       return {

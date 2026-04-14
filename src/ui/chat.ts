@@ -26,6 +26,9 @@ export interface ChatUIOptions {
 
 export interface ChatUI {
   onSubmit(handler: (text: string) => void): void;
+  onThemeChange(handler: (theme: ThemeName) => void): void;
+  onRefresh(handler: () => void): void;
+  onFileSearch(handler: (query: string) => Promise<string[]>): void;
   pushMessage(message: ChatMessage): string;
   updateMessage(id: string, patch: Partial<ChatMessage>): void;
   removeMessage(id: string): void;
@@ -191,6 +194,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   let statusText = options.initialStatus ?? "Watching…";
   let runtimeInfo = "";
   let submitHandler: ((text: string) => void) | null = null;
+  let themeChangeHandler: ((theme: ThemeName) => void) | null = null;
+  let refreshHandler: (() => void) | null = null;
+  let fileSearchHandler: ((query: string) => Promise<string[]>) | null = null;
   let destroyed = false;
 
   let cols = Math.max(40, process.stdout.columns ?? 80);
@@ -206,6 +212,8 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   let cursorRow = 0;
   let cursorCol = 0;
   let matchingCommands: readonly ChatCommandDefinition[] = [];
+  let matchingFiles: string[] = [];
+  let selectedPickerIndex = 0;
   let renderPending = false;
   let lastRenderTime = 0;
 
@@ -223,11 +231,11 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     return draftLines.length === 1 && draftLines[0] === "";
   }
 
-  function resetDraft() {
+  async function resetDraft() {
     draftLines = [""];
     cursorRow = 0;
     cursorCol = 0;
-    updateMatchingCommands();
+    await updateMatchingCommands();
   }
 
   function clampCursor() {
@@ -235,12 +243,40 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     cursorCol = Math.max(0, Math.min(cursorCol, currentLine().length));
   }
 
-  function updateMatchingCommands() {
-    const singleLine = draftLines.length === 1 ? draftLines[0] ?? "" : "";
-    matchingCommands = singleLine.startsWith("/") ? filterCommands(singleLine) : [];
+  async function updateMatchingCommands() {
+    const line = currentLine();
+    const textBeforeCursor = line.slice(0, cursorCol);
+
+    // Command handling (must be at start of first line)
+    if (cursorRow === 0 && line.startsWith("/")) {
+      const prevCount = matchingCommands.length;
+      matchingCommands = filterCommands(line);
+      matchingFiles = [];
+      if (matchingCommands.length !== prevCount) {
+        selectedPickerIndex = 0;
+      }
+      return;
+    }
+
+    // File handling (starts with @ anywhere)
+    const atMatch = textBeforeCursor.match(/@(\S*)$/);
+    if (atMatch && fileSearchHandler) {
+      const query = atMatch[1] || "";
+      const results = await fileSearchHandler(query);
+      const prevCount = matchingFiles.length;
+      matchingFiles = results;
+      matchingCommands = [];
+      if (matchingFiles.length !== prevCount) {
+        selectedPickerIndex = 0;
+      }
+    } else {
+      matchingCommands = [];
+      matchingFiles = [];
+      selectedPickerIndex = 0;
+    }
   }
 
-  function insertText(text: string) {
+  async function insertText(text: string) {
     const segments = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
     const line = currentLine();
     const before = line.slice(0, cursorCol);
@@ -249,7 +285,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     if (segments.length === 1) {
       draftLines[cursorRow] = before + segments[0] + after;
       cursorCol += segments[0]!.length;
-      updateMatchingCommands();
+      await updateMatchingCommands();
       return;
     }
 
@@ -261,19 +297,19 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     draftLines.splice(cursorRow, 1, ...nextLines);
     cursorRow += segments.length - 1;
     cursorCol = (segments.at(-1) ?? "").length;
-    updateMatchingCommands();
+    await updateMatchingCommands();
   }
 
-  function insertNewline() {
-    insertText("\n");
+  async function insertNewline() {
+    await insertText("\n");
   }
 
-  function deleteBackward() {
+  async function deleteBackward() {
     if (cursorCol > 0) {
       const line = currentLine();
       draftLines[cursorRow] = line.slice(0, cursorCol - 1) + line.slice(cursorCol);
       cursorCol--;
-      updateMatchingCommands();
+      await updateMatchingCommands();
       return;
     }
 
@@ -285,14 +321,14 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     cursorRow--;
     cursorCol = previous.length;
     draftLines[cursorRow] = previous + line;
-    updateMatchingCommands();
+    await updateMatchingCommands();
   }
 
-  function deleteForward() {
+  async function deleteForward() {
     const line = currentLine();
     if (cursorCol < line.length) {
       draftLines[cursorRow] = line.slice(0, cursorCol) + line.slice(cursorCol + 1);
-      updateMatchingCommands();
+      await updateMatchingCommands();
       return;
     }
 
@@ -301,7 +337,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     const next = draftLines[cursorRow + 1] ?? "";
     draftLines[cursorRow] = line + next;
     draftLines.splice(cursorRow + 1, 1);
-    updateMatchingCommands();
+    await updateMatchingCommands();
   }
 
   function moveLeft(ctrl = false) {
@@ -380,7 +416,8 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   function inputStartRow() { return vpEnd() + 2; }
 
   function pickerRowCount() {
-    return matchingCommands.length > 0 ? 1 + matchingCommands.length : 0;
+    const count = matchingCommands.length || matchingFiles.length;
+    return count > 0 ? 1 + Math.min(count, 10) : 0;
   }
 
   function effectiveVH() {
@@ -532,11 +569,33 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     }
 
     if (pRows > 0) {
-      buf.push(midBorder("COMMANDS", cols, theme), "\r\n");
-      for (const cmd of matchingCommands) {
-        const name = chalk.hex(theme.assistant).bold(cmd.command.padEnd(14));
-        const desc = chalk.hex(theme.muted)(cmd.description);
-        buf.push(contentRow(truncateVisible(`  ${name}  ${desc}`, iw()), cols, theme), "\r\n");
+      const pickerLabel = matchingCommands.length > 0 ? "COMMANDS" : "FILES";
+      buf.push(midBorder(pickerLabel, cols, theme), "\r\n");
+      
+      const items = matchingCommands.length > 0 ? matchingCommands : matchingFiles;
+      // Ensure selected index stays within bounds if list changed
+      selectedPickerIndex = Math.min(selectedPickerIndex, items.length - 1);
+      if (selectedPickerIndex < 0 && items.length > 0) selectedPickerIndex = 0;
+
+      // Show up to 10 items
+      const viewItems = items.slice(0, 10);
+      for (let i = 0; i < viewItems.length; i++) {
+        const item = viewItems[i]!;
+        const isSelected = i === selectedPickerIndex;
+        
+        let rowText = "";
+        if (typeof item === "string") {
+          // File path
+          rowText = isSelected ? chalk.bgHex(theme.track).bold(` > ${item}`) : `   ${item}`;
+        } else {
+          // Command definition
+          const name = item.command.padEnd(14);
+          const desc = item.description;
+          rowText = isSelected 
+            ? chalk.bgHex(theme.track).bold(` > ${name}  ${desc}`) 
+            : `   ${chalk.hex(theme.assistant).bold(name)}  ${chalk.hex(theme.muted)(desc)}`;
+        }
+        buf.push(contentRow(truncateVisible(rowText, iw()), cols, theme), "\r\n");
       }
     }
 
@@ -577,11 +636,32 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   }
   process.stdin.resume();
 
-  function onKeypress(ch: string | undefined, key: readline.Key) {
+  async function onKeypress(ch: string | undefined, key: readline.Key) {
     if (!key || destroyed) return;
 
     if (key.ctrl && key.name === "c") {
       process.kill(process.pid, "SIGINT");
+      return;
+    }
+
+    if (key.ctrl && key.name === "k") {
+      await resetDraft();
+      scheduleRender();
+      return;
+    }
+
+    if (key.ctrl && key.name === "r") {
+      refreshHandler?.();
+      return;
+    }
+
+    if (key.ctrl && key.name === "t") {
+      const allThemes = Object.keys(THEMES) as ThemeName[];
+      const currentIndex = allThemes.indexOf(theme.name);
+      const nextIndex = (currentIndex + 1) % allThemes.length;
+      const nextTheme = allThemes[nextIndex]!;
+      setTheme(nextTheme);
+      themeChangeHandler?.(nextTheme);
       return;
     }
 
@@ -601,6 +681,8 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       scheduleRender();
       return;
     }
+
+    const pCount = matchingCommands.length || matchingFiles.length;
 
     if (isDraftBlank() && key.name === "g") {
       if (key.shift) {
@@ -625,7 +707,53 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       return;
     }
 
+    // Picker Navigation
+    if (pCount > 0 && (key.name === "up" || key.name === "down")) {
+      if (key.name === "up") {
+        selectedPickerIndex = (selectedPickerIndex - 1 + pCount) % pCount;
+      } else {
+        selectedPickerIndex = (selectedPickerIndex + 1) % pCount;
+      }
+      scheduleRender();
+      return;
+    }
+
     const isEnter = key.name === "return" || key.name === "enter";
+    const isTab = key.name === "tab";
+
+    // Picker Selection
+    if (pickerRowCount() > 0 && (isEnter || isTab)) {
+      if (matchingCommands.length > 0) {
+        const cmd = matchingCommands[selectedPickerIndex]!;
+        const currentText = (draftLines[0] || "").trim();
+        
+        // If the user presses Enter and the command is already fully typed, SUBMIT IT
+        if (isEnter && currentText === cmd.command) {
+          submitDraft();
+          scheduleRender();
+          return;
+        }
+
+        // Otherwise, complete the command
+        draftLines[0] = cmd.command + " ";
+        cursorCol = draftLines[0].length;
+      } else if (matchingFiles.length > 0) {
+        const file = matchingFiles[selectedPickerIndex]!;
+        const line = currentLine();
+        const textBeforeCursor = line.slice(0, cursorCol);
+        const atMatch = textBeforeCursor.match(/@(\S*)$/);
+        if (atMatch) {
+          const beforeAt = textBeforeCursor.slice(0, atMatch.index);
+          const afterCursor = line.slice(cursorCol);
+          draftLines[cursorRow] = beforeAt + "@" + file + " " + afterCursor;
+          cursorCol = beforeAt.length + file.length + 2; // +1 for @, +1 for space
+        }
+      }
+      await updateMatchingCommands();
+      scheduleRender();
+      return;
+    }
+
     const isShiftEnter = isEnter && (key.shift || key.sequence === "\x1b[13;2u" || key.sequence === "\x1b[1;2R");
     const isAltEnter = isEnter && key.meta;
     const isCtrlJ = key.ctrl && key.name === "j";
@@ -636,7 +764,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       currentLine()[cursorCol - 1] === "\\";
 
     if (isShiftEnter || isAltEnter || isCtrlJ || isCtrlO || shouldContinueLine) {
-      insertNewlineAtCursor(shouldContinueLine);
+      await insertNewlineAtCursor(shouldContinueLine);
       scheduleRender();
       return;
     }
@@ -650,34 +778,40 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     switch (key.name) {
       case "left":
         moveLeft(Boolean(key.ctrl));
+        await updateMatchingCommands();
         scheduleRender();
         return;
       case "right":
         moveRight(Boolean(key.ctrl));
+        await updateMatchingCommands();
         scheduleRender();
         return;
       case "up":
         moveUp();
+        await updateMatchingCommands();
         scheduleRender();
         return;
       case "down":
         moveDown();
+        await updateMatchingCommands();
         scheduleRender();
         return;
       case "backspace":
-        deleteBackward();
+        await deleteBackward();
         scheduleRender();
         return;
       case "delete":
-        deleteForward();
+        await deleteForward();
         scheduleRender();
         return;
       case "home":
         cursorCol = 0;
+        await updateMatchingCommands();
         scheduleRender();
         return;
       case "end":
         cursorCol = currentLine().length;
+        await updateMatchingCommands();
         scheduleRender();
         return;
       default:
@@ -685,7 +819,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     }
 
     if (typeof ch === "string" && ch.length > 0 && !key.ctrl && !key.meta) {
-      insertText(ch);
+      await insertText(ch);
       scheduleRender();
     }
   }
@@ -782,6 +916,18 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     submitHandler = handler;
   }
 
+  function onThemeChange(handler: (theme: ThemeName) => void) {
+    themeChangeHandler = handler;
+  }
+
+  function onRefresh(handler: () => void) {
+    refreshHandler = handler;
+  }
+
+  function onFileSearch(handler: (query: string) => Promise<string[]>) {
+    fileSearchHandler = handler;
+  }
+
   function startWatchingIndicator() {}
   function stopWatchingIndicator() {}
   function focusInput() {
@@ -806,6 +952,9 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
 
   return {
     onSubmit,
+    onThemeChange,
+    onRefresh,
+    onFileSearch,
     pushMessage,
     updateMessage,
     removeMessage,

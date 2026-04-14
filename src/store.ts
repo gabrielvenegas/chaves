@@ -404,7 +404,7 @@ export class Store {
   }
 
   getRecentMessages(options: RecentMessageOptions = {}): StoredMessage[] {
-    const limit = Math.max(1, Math.min(options.limit ?? 20, 500));
+    const limit = Math.max(1, Math.min(options.limit ?? 20, 10000));
 
     if (options.channel) {
       const rows = this.db
@@ -592,22 +592,28 @@ export class Store {
 
   listFiles(options: ListFilesOptions = {}): ListFileResult[] {
     const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
-    const safePrefix = options.pathPrefix
-      ? this.assertSafeRelativePath(options.pathPrefix)
-      : null;
-    const likePrefix = safePrefix ? `${safePrefix}%` : null;
+    const pattern = options.pathPrefix ? `%${options.pathPrefix}%` : "%";
 
     const rows = this.db
       .prepare(
         `
       SELECT path, language, blocked, size_bytes, timestamp
       FROM files
-      WHERE (? IS NULL OR path LIKE ?)
-      ORDER BY path ASC
+      WHERE path LIKE ?
+      ORDER BY 
+        CASE 
+          WHEN path LIKE ? THEN 1 -- prioritize filename matches
+          ELSE 2 
+        END,
+        path ASC
       LIMIT ?
     `,
       )
-      .all(likePrefix, likePrefix, limit) as Array<{
+      .all(
+        pattern, 
+        options.pathPrefix ? `%/${options.pathPrefix}%` : "%", 
+        limit
+      ) as Array<{
       path: string;
       language: string;
       blocked: number;

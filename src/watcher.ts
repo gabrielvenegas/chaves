@@ -1,6 +1,6 @@
 import chokidar from "chokidar";
 import { EventEmitter } from "events";
-import { relative } from "path";
+import { relative, resolve } from "path";
 import { logger } from "./logger.js";
 import { DiffTracker, type FileChange } from "./diff-tracker.js";
 import { shield } from "./shield.js";
@@ -18,7 +18,8 @@ export class Watcher extends EventEmitter {
   private watcher: chokidar.FSWatcher | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   private isIdle = false;
-  private readonly idleThreshold = 30_000;
+  private readonly idleThreshold = 15_000;
+  private eventCount = 0;
   private diffTracker: DiffTracker;
 
   constructor(private projectPath: string) {
@@ -49,17 +50,20 @@ export class Watcher extends EventEmitter {
 
     this.watcher
       .on("add", (path) => {
-        if (!shield.isSensitiveFile(path)) {
-          void this.handleEvent("file_create", path);
+        const fullPath = resolve(this.projectPath, path);
+        if (!shield.isSensitiveFile(fullPath)) {
+          void this.handleEvent("file_create", fullPath);
         }
       })
       .on("change", (path) => {
-        if (!shield.isSensitiveFile(path)) {
-          void this.handleEvent("file_change", path);
+        const fullPath = resolve(this.projectPath, path);
+        if (!shield.isSensitiveFile(fullPath)) {
+          void this.handleEvent("file_change", fullPath);
         }
       })
       .on("unlink", (path) => {
-        void this.handleEvent("file_delete", path);
+        const fullPath = resolve(this.projectPath, path);
+        void this.handleEvent("file_delete", fullPath);
       })
       .on("ready", () => {
         logger.info("WATCHER", "✅ Watcher ready and listening for changes");
@@ -102,7 +106,8 @@ export class Watcher extends EventEmitter {
     this.emit("event", { type, path, change } as WatcherEvent);
     logger.debug("WATCHER", `Emitted event: ${type} for ${path}`);
 
-    if (this.diffTracker.pendingCount > 15) {
+    this.eventCount++;
+    if (this.eventCount > 10) {
       this.triggerSummarization();
     }
   }
@@ -129,6 +134,7 @@ export class Watcher extends EventEmitter {
   }
 
   private triggerSummarization() {
+    this.eventCount = 0;
     const changes = this.diffTracker.flushChanges();
 
     if (changes.length === 0) return;
@@ -161,5 +167,9 @@ export class Watcher extends EventEmitter {
     }
 
     logger.info("WATCHER", "✅ Watcher stopped");
+  }
+
+  get pendingEventCount(): number {
+    return this.eventCount;
   }
 }

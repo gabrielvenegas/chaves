@@ -1,5 +1,5 @@
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 import { logger } from "./logger.js";
 import { shield } from "./shield.js";
 import type { ActivityEvent, StoredMessage } from "./store.js";
@@ -53,6 +53,7 @@ interface GenerateProactiveInsightInput {
   recentEvents?: ActivityEvent[];
   previousSummary?: string;
   previousChatSummary?: string;
+  workingMemory?: Record<string, string>;
   userIntent?: string;
   previousInsight?: SessionGoalContext | null;
 }
@@ -147,12 +148,18 @@ export class Summarizer {
   }
 
   private supportsToolCalling(): boolean {
-    const model = this.model.trim().toLowerCase();
-    return model.startsWith("openai/") || model.startsWith("anthropic/");
+    // OpenRouter provides a unified interface for tool calling across most modern models.
+    // Instead of a strict whitelist, we now allow tool calling by default.
+    return true;
   }
 
   private isLikelyCodeQuery(text: string): boolean {
-    return /(where|implement|function|class|method|module|file|path|src\/|\.ts|\.js|\.tsx|\.jsx|error|bug|fix|stack|trace|why)/i
+    // Treat almost everything as a potential code query to avoid hallucinations
+    // unless it's extremely short or clearly just social filler.
+    if (text.length < 3) return false;
+
+    // Broaden regex to include common question words in EN and PT
+    return /(where|implement|function|class|method|module|file|path|src\/|\.ts|\.js|\.tsx|\.jsx|error|bug|fix|stack|trace|why|what|how|who|list|tell|explain|que|como|onde|quem|fazer|mostra|explica|ajuda|projeto|build|context)/i
       .test(text);
   }
 
@@ -187,9 +194,9 @@ export class Summarizer {
     );
 
     const maxTokensByLevel: Record<MessageFrequencyLevel, number> = {
-      1: 180,
-      2: 220,
-      3: 400,
+      1: 300,
+      2: 500,
+      3: 800,
     };
 
     logger.aiRequest(prompt.length);
@@ -230,7 +237,16 @@ export class Summarizer {
     }
 
     parts.push(
-      `Recent IDE activity:\n${eventLog}\n\nSummarize current focus, most recent step, and likely next step.`,
+      [
+        "Recent IDE activity:",
+        eventLog,
+        "",
+        "Instructions:",
+        "1. Identify the user's current focus (e.g. 'Refactoring the Auth service').",
+        "2. State the most recent step taken.",
+        "3. Suggest the most logical next step.",
+        "Ensure the summary is cohesive and complete.",
+      ].join("\n"),
     );
 
     return parts.join("\n\n");
@@ -252,7 +268,17 @@ export class Summarizer {
     }
 
     parts.push(
-      `File diffs:\n${shield.sanitize(diffSummary)}\n\nSummarize intent, scope, and next steps.`,
+      [
+        "File diffs:",
+        shield.sanitize(diffSummary),
+        "",
+        "Instructions:",
+        "Analyze these changes and summarize:",
+        "- The core intent of the modification.",
+        "- The technical scope (what was touched).",
+        "- The most logical next step for the user.",
+        "Maintain a professional and helpful tone.",
+      ].join("\n"),
     );
 
     return parts.join("\n\n");
@@ -272,9 +298,9 @@ export class Summarizer {
     );
 
     const maxTokensByLevel: Record<MessageFrequencyLevel, number> = {
-      1: 240,
-      2: 320,
-      3: 520,
+      1: 400,
+      2: 600,
+      3: 1000,
     };
 
     logger.aiRequest(prompt.length);
@@ -308,6 +334,7 @@ export class Summarizer {
       previousChatSummary: input.previousChatSummary,
       workingMemory: input.workingMemory,
       userIntent: input.userIntent,
+      useTools,
       fallbackContext:
         !useTools && this.isLikelyCodeQuery(input.userMessage)
           ? input.fallbackContext
@@ -415,21 +442,25 @@ export class Summarizer {
       "You are the Memory Manager for Chaves, a coding companion.",
       "Your task is to analyze the recent chat transcript and update the durable project memory.",
       "",
+      "CRITICAL: Output a single JSON object ONLY. No preamble or postscript.",
+      "",
       "Goals for memory:",
       "1. Long-term preferences (e.g., 'prefers Vitest over Jest', 'likes early returns').",
       "2. Project-wide context (e.g., 'we are migrating to a monorepo', 'the main branch is protected').",
       "3. Long-running goals (e.g., 'working on the auth flow refactor').",
+      "",
+      "SCHEMA:",
+      "{ \"key-name\": \"updated fact string or null to delete\" }",
+      "",
+      "EXAMPLE:",
+      "Chat: 'Actually, let's use Vitest instead of Jest for this project.'",
+      "Memory: { \"testing-framework\": \"Vitest\" }",
       "",
       "Current Memory state:",
       currentMemoryStr,
       "",
       "Recent Chat transcript:",
       transcript,
-      "",
-      "Output a single JSON object where keys are the memory identifiers and values are the updated strings.",
-      "Use null as a value to DELETE a key if it is no longer relevant.",
-      "Only include keys that NEED to be updated or deleted.",
-      "Keys should be concise (kebab-case). Values should be clear facts.",
     ].join("\n");
 
     logger.aiRequest(prompt.length);
@@ -460,14 +491,15 @@ export class Summarizer {
   ): Promise<ProactiveInsight> {
     this.assertConfigured();
 
-    const sections: string[] = [
-      "Analyze the current coding session and return a single JSON object only.",
-      "Infer the user's short-term goal, current focus, and the best next suggestion.",
-      "Assess whether the previous suggestion is now addressed, ignored, irrelevant, or still active.",
-      "Avoid generic suggestions like 'add tests' unless the current changes make that the most relevant next action.",
-      "Set shouldNotify=false when there is no meaningful proactive message to show right now.",
+    const sections: string[] = [];
+    sections.push(
+      "Analyze the current coding session and return a single JSON object ONLY.",
+      "Your goal is to infer the user's short-term objective, identify their current technical focus, and provide a high-value suggestion.",
+      "HIGH-SIGNAL ADVICE: Your suggestionText must be highly specific, actionable, and technically relevant. Identify potential bugs, architectural gaps, or the immediate next logical implementation step.",
+      "Assess the status of the previous suggestion (active, addressed, ignored, or irrelevant).",
+      "NOTIFICATION RULE: Set shouldNotify=true whenever you have a concrete, helpful suggestion. Only set shouldNotify=false if the recent activity is purely trivial (e.g. whitespace only) or if there is no clear direction yet.",
       'Return JSON with keys: goal, focus, status, suggestionKey, suggestionText, relatedFiles, shouldNotify.',
-    ];
+    );
 
     if (input.previousSummary) {
       sections.push(`Previous coding summary:\n${shield.sanitize(input.previousSummary)}`);
@@ -475,6 +507,13 @@ export class Summarizer {
 
     if (input.previousChatSummary) {
       sections.push(`Rolling chat memory:\n${shield.sanitize(input.previousChatSummary)}`);
+    }
+
+    if (input.workingMemory && Object.keys(input.workingMemory).length > 0) {
+      const memoryLines = Object.entries(input.workingMemory)
+        .map(([key, value]) => `- ${key}: ${value}`)
+        .join("\n");
+      sections.push(`Durable Project Memory & Preferences:\n${memoryLines}`);
     }
 
     if (input.userIntent) {
@@ -514,19 +553,30 @@ export class Summarizer {
     const prompt = shield.sanitize(sections.join("\n\n"));
     logger.aiRequest(prompt.length);
 
-    const { text } = await generateText({
-      model: this.buildChatModel(),
-      system: this.buildSummarySystemPrompt(),
-      prompt,
-      maxTokens: 420,
-    });
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 30_000);
 
-    if (text.trim().length === 0) {
-      throw new Error("Empty proactive insight returned from AI provider");
+    try {
+      const { text } = await generateText({
+        model: this.buildChatModel(),
+        system: this.buildSummarySystemPrompt(),
+        prompt,
+        maxTokens: 800,
+        abortSignal: abortController.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (text.trim().length === 0) {
+        throw new Error("Empty proactive insight returned from AI provider");
+      }
+
+      logger.aiResponse(text.length);
+      return this.parseProactiveInsight(text);
+    } catch (error) {
+      clearTimeout(timeout);
+      throw error;
     }
-
-    logger.aiResponse(text.length);
-    return this.parseProactiveInsight(text);
   }
 
   private async generateChatCompletion(input: {
@@ -538,7 +588,7 @@ export class Summarizer {
   }): Promise<string> {
     const toolEnabled = Boolean(input.tools);
     const abortController = new AbortController();
-    const timeoutMs = 45_000;
+    const timeoutMs = 60_000; // slightly longer for multi-step tools
     const timeout = setTimeout(() => {
       abortController.abort(
         new Error(`AI provider timed out after ${Math.floor(timeoutMs / 1000)}s`),
@@ -548,17 +598,13 @@ export class Summarizer {
     const maxTokensByLevel: Record<MessageFrequencyLevel, number> = {
       1: 1200,
       2: 3000,
-      3: 3600,
+      3: 4200,
     };
-
-    logger.aiRequest(
-      input.messages.reduce((total, message) => total + message.content.length, 0),
-    );
 
     try {
       await input.onStatus?.("Thinking...");
 
-      const response = await generateText({
+      const result = await streamText({
         model: this.buildChatModel(),
         system: input.system,
         messages: input.messages.map((message) => ({
@@ -577,23 +623,24 @@ export class Summarizer {
               } else {
                 await input.onStatus?.("Thinking...");
               }
-              logger.debug("AI", "Chat step finished", {
-                finishReason: step.finishReason,
-                toolCalls: step.toolCalls?.length ?? 0,
-                toolResults: step.toolResults?.length ?? 0,
-              });
             }
           : undefined,
       });
 
-      const text = response.text;
+      let fullText = "";
+      for await (const textDelta of result.textStream) {
+        fullText += textDelta;
+        if (input.onTextDelta) {
+          await input.onTextDelta(textDelta);
+        }
+      }
 
-      if (text.trim().length === 0) {
+      if (fullText.trim().length === 0) {
         throw new Error("Empty response returned from AI provider");
       }
 
-      logger.aiResponse(text.length);
-      return text;
+      logger.aiResponse(fullText.length);
+      return fullText;
     } catch (error) {
       logger.aiError(error);
       throw error;
@@ -612,6 +659,7 @@ export class Summarizer {
       `Respond in ${lang} only. No other language.`,
       verbosity,
       personality,
+      "CRITICAL: Always complete your thoughts and sentences. Do not stop mid-sentence.",
       "If explicit user guidance conflicts with inferred activity, explicit user guidance wins.",
       "Be grounded in the provided context. Do not claim actions were taken unless explicitly stated.",
     ].join("\n");
@@ -627,9 +675,11 @@ export class Summarizer {
       `Respond in ${lang} only.`,
       verbosity,
       personality,
+      "DISCOVERY FIRST: Do not assume what the project is. Use tools to check the README.md, package.json, or list files to verify what you are working on before giving summary advice.",
       "Latest explicit user guidance overrides any inferred direction from file activity or prior summaries.",
       "If the user corrects the current direction, immediately pivot to the corrected goal and stop defending the previous inference.",
-      "When codebase facts are needed, use tools to query project data instead of guessing.",
+      "When codebase facts are needed, use ONLY the following tools: [recent_events, recent_diffs, get_diff, get_file, search_code, terminal_output, list_files].",
+      "Do not assume any other tools exist (e.g., list_directory, read_file, run_shell_command are NOT available).",
       "Do not edit files or run commands; provide advisory guidance only.",
       "Do not claim actions were executed unless explicitly in context.",
     ].join("\n");
@@ -638,19 +688,19 @@ export class Summarizer {
   private verbosityGuidance(kind: "chat" | "summary"): string {
     if (this.frequencyLevel === 1) {
       return kind === "chat"
-        ? "Be concise: 1-3 sentences unless asked otherwise. High-signal only."
-        : "Be concise: 1-2 sentences. No bullets.";
+        ? "Be concise: 1-3 complete sentences. High-signal only."
+        : "Be concise: 1-2 complete sentences. Do not use bullets. Ensure you finish the thought.";
     }
 
     if (this.frequencyLevel === 3) {
       return kind === "chat"
-        ? "Be comprehensive: explain reasoning, include brief structure (short bullets/sections are allowed), and provide concrete next steps."
-        : "Be comprehensive: include more detail and concrete next steps. Short bullets are allowed.";
+        ? "Be comprehensive: explain reasoning, include structure (short bullets/sections are allowed), and provide concrete next steps."
+        : "Be comprehensive: include more detail and concrete next steps. Short bullets are allowed. Always finish every section.";
     }
 
     return kind === "chat"
-      ? "Be standard: concise conversational flow; expand when it increases clarity."
-      : "Be standard: concise but clear, with a concrete next step.";
+      ? "Be standard: concise conversational flow; expand when it increases clarity. Always finish your sentences."
+      : "Be standard: concise but clear, with a concrete next step. Ensure the output is complete.";
   }
 
   private personalityGuidance(): string {
@@ -714,6 +764,7 @@ export class Summarizer {
     workingMemory?: Record<string, string>;
     userIntent?: string;
     fallbackContext?: string;
+    useTools?: boolean;
   }): Array<{ role: ChatRole; content: string }> {
     const messages: Array<{ role: ChatRole; content: string }> = [];
     const contextSections: string[] = [];
@@ -743,9 +794,15 @@ export class Summarizer {
       );
     }
 
-    contextSections.push(
-      "Project DB context is available via tools for code, events, and diffs. Use tools when facts are needed.",
-    );
+    if (input.useTools) {
+      contextSections.push(
+        "Project context is available via tools: [recent_events, recent_diffs, get_diff, get_file, search_code, terminal_output, list_files]. Use these tools when specific codebase facts are needed. Do not assume any other tools exist.",
+      );
+    } else {
+      contextSections.push(
+        "Tools are NOT available for this specific turn. Rely on the provided context or ask the user for more information.",
+      );
+    }
 
     if (input.fallbackContext) {
       contextSections.push(

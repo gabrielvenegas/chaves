@@ -2,8 +2,22 @@ export const WATCHER_IGNORED_PATTERNS: RegExp[] = [
   /node_modules/,
   /\.git/,
   /\.chaves\.db/,
+  /\.chaves\.db-journal/,
+  /\.chaves\.db-shm/,
+  /\.chaves\.db-wal/,
   /dist/,
+  /build/,
   /\.next/,
+  /\.DS_Store/,
+  /\.venv/,
+  /venv/,
+  /env/,
+  /\.env\..*/, // ignore .env.local, .env.development, etc.
+  /__pycache__/,
+  /\.pytest_cache/,
+  /\.turbo/,
+  /out/,
+  /target/, // Rust build
 ];
 
 export const DEFAULT_MAX_FILE_SIZE_BYTES = 1024 * 1024;

@@ -56,7 +56,22 @@ export class UI {
     });
   }
 
+  onThemeChange(handler: (theme: ThemeName) => void) {
+    this.chat.onThemeChange(handler);
+  }
+
+  onRefresh(handler: () => void) {
+    this.chat.onRefresh(handler);
+  }
+
+  onFileSearch(handler: (query: string) => Promise<string[]>) {
+    this.chat.onFileSearch(handler);
+  }
+
   logTerminalEvent(event: TerminalEventRecord) {
+    if (event.stream === "stderr") {
+      this.showInfo(`Relaying stderr from dev pane: ${event.data.trim()}`);
+    }
     this.chat.pushLog(event.stream, event.data);
   }
 

@@ -109,17 +109,17 @@ function normalizeRelatedFiles(paths: string[]): string[] {
 }
 
 function buildProactiveMessage(insight: ProactiveInsight): string {
-  const lines = [
-    `Focus: ${insight.goal} -> ${insight.focus}`,
-    `Suggestion: ${insight.suggestionText}`,
+  const sections = [
+    `**Current Focus**\n${insight.goal} → ${insight.focus}`,
+    `**Suggestion**\n${insight.suggestionText}`,
   ];
 
   const relatedFiles = normalizeRelatedFiles(insight.relatedFiles);
   if (relatedFiles.length > 0) {
-    lines.push(`Related files: ${relatedFiles.join(", ")}`);
+    sections.push(`**Related Files**\n${relatedFiles.join(", ")}`);
   }
 
-  return lines.join("\n");
+  return sections.join("\n\n");
 }
 
 async function runTmuxRelayMode(projectPath: string): Promise<void> {
@@ -253,11 +253,11 @@ async function main() {
       : process.env.OPENROUTER_API_KEY;
 
   const baseSummaryThreshold =
-    frequencyLevel === 1 ? 25 : frequencyLevel === 3 ? 8 : 15;
+    frequencyLevel === 1 ? 20 : frequencyLevel === 3 ? 5 : 10;
   const baseMinUniqueFiles =
-    frequencyLevel === 1 ? 3 : frequencyLevel === 3 ? 1 : 2;
+    frequencyLevel === 1 ? 2 : frequencyLevel === 3 ? 1 : 1;
   const baseMinCountableEvents =
-    frequencyLevel === 1 ? 15 : frequencyLevel === 3 ? 6 : 10;
+    frequencyLevel === 1 ? 10 : frequencyLevel === 3 ? 4 : 7;
 
   const SUMMARY_THRESHOLD = parseEnvInt(
     "CHAVES_SUMMARY_THRESHOLD",
@@ -285,6 +285,9 @@ async function main() {
     showPaneToggleHint: tmuxBootstrap.managed,
     theme: store.getTheme(),
   });
+  ui.onThemeChange((newTheme) => {
+    store.setTheme(newTheme);
+  });
   const tools = createChavesTools({ store });
   const indexer = new Indexer(projectPath, store, {
     maxFileSizeBytes: INDEX_MAX_FILE_SIZE,
@@ -292,6 +295,44 @@ async function main() {
     onProgress(indexed, total) {
       ui.setStatus(`Indexing... ${indexed}/${total}`);
     },
+  });
+
+  async function performIndexing(forceReindex = false) {
+    const existingCount = store.getIndexedFileCount();
+
+    if (existingCount > 0 && !forceReindex) {
+      ui.showInfo(`Using ${existingCount} indexed files (CHAVES_FORCE_REINDEX=true to rebuild)`);
+      return;
+    }
+
+    ui.setWatching(false);
+    ui.setStatus("Indexing...");
+    ui.showInfo(forceReindex ? "Re-indexing codebase..." : "Indexing codebase...");
+    try {
+      const result = await indexer.indexProject();
+      ui.showSuccess(
+        `Indexed ${result.indexedFiles} files (${result.blockedFiles} blocked, ${result.skippedFiles} skipped)`,
+      );
+    } catch (error) {
+      logger.error("APP", "Codebase indexing failed", error);
+      ui.showError("Codebase indexing failed", error as Error);
+    } finally {
+      ui.setStatus("Watching...");
+      ui.setWatching(true);
+      ui.focusInput();
+    }
+  }
+
+  ui.onRefresh(() => {
+    void performIndexing(true);
+  });
+
+  ui.onFileSearch(async (query) => {
+    const results = store.listFiles({ 
+      pathPrefix: query,
+      limit: 10 
+    });
+    return results.map(f => f.path);
   });
 
   let eventsSinceLastSummary = 0;
@@ -357,8 +398,10 @@ async function main() {
   function updateRuntimeInfo() {
     const model = shortenModelName(summarizer.getModel());
     const thinking = summarizer.getThinkingEffort();
+    const pending = watcher.pendingEventCount;
+    const pendingStr = pending > 0 ? ` | pending ${pending}` : "";
     const runtimeInfo =
-      `model ${model} | think ${thinking} | rss ${formatMegabytes(latestRuntimeStats.rssBytes)} | cpu ${latestRuntimeStats.cpuPercent.toFixed(1)}%`;
+      `model ${model} | think ${thinking} | rss ${formatMegabytes(latestRuntimeStats.rssBytes)} | cpu ${latestRuntimeStats.cpuPercent.toFixed(1)}%${pendingStr}`;
     ui.setRuntimeInfo(runtimeInfo);
   }
 
@@ -377,6 +420,7 @@ async function main() {
 
   if (tmuxBootstrap.managed) {
     ui.showSuccess(`Dev terminal attached on the right (Ctrl+L to switch pane)`);
+    ui.showInfo("Launching managed tmux session (chat + dev shell)");
   } else if (tmuxBootstrap.tmuxMissing) {
     ui.showError(
       "tmux is required for the split dev terminal; continuing in chat-only mode.",
@@ -388,32 +432,7 @@ async function main() {
   }
 
   if (INDEX_ON_START) {
-    void (async () => {
-      const forceReindex = process.env.CHAVES_FORCE_REINDEX === "true";
-      const existingCount = store.getIndexedFileCount();
-
-      if (existingCount > 0 && !forceReindex) {
-        ui.showInfo(`Using ${existingCount} indexed files (CHAVES_FORCE_REINDEX=true to rebuild)`);
-        return;
-      }
-
-      ui.setWatching(false);
-      ui.setStatus("Indexing...");
-      ui.showInfo(forceReindex ? "Re-indexing codebase..." : "Indexing codebase...");
-      try {
-        const result = await indexer.indexProject();
-        ui.showSuccess(
-          `Indexed ${result.indexedFiles} files (${result.blockedFiles} blocked, ${result.skippedFiles} skipped)`,
-        );
-      } catch (error) {
-        logger.error("APP", "Codebase indexing failed", error);
-        ui.showError("Codebase indexing failed", error as Error);
-      } finally {
-        ui.setStatus("Watching...");
-        ui.setWatching(true);
-        ui.focusInput();
-      }
-    })();
+    void performIndexing(process.env.CHAVES_FORCE_REINDEX === "true");
   }
 
   async function maybeSummarizeChatHistory() {
@@ -501,14 +520,17 @@ async function main() {
 
     const sameSuggestion = previousState?.suggestionKey === nextState.suggestionKey;
     const goalChanged = previousState?.goal !== nextState.goal;
-    const alreadyActive = sameSuggestion && nextState.status === "active";
+    const timeSinceLastUpdate = previousState ? Date.now() - previousState.updatedAt : Infinity;
+    const suggestionExpired = timeSinceLastUpdate > 5 * 60 * 1000; // 5 minutes
+
+    const alreadyActive = sameSuggestion && nextState.status === "active" && !suggestionExpired;
     const transitioned =
       previousState?.status !== nextState.status &&
       nextState.status !== "active";
     const shouldDisplay =
       insight.shouldNotify &&
-      !alreadyActive &&
-      (goalChanged || !sameSuggestion || transitioned || previousState === null);
+      (!alreadyActive || suggestionExpired) &&
+      (goalChanged || !sameSuggestion || transitioned || previousState === null || suggestionExpired);
 
     return {
       shouldDisplay,
@@ -534,6 +556,7 @@ async function main() {
         recentEvents: input.recentEvents,
         previousSummary: lastSummary?.content,
         previousChatSummary: lastChatSummary?.content,
+        workingMemory: store.getWorkingMemory(),
         userIntent: buildUserIntentContext(store),
         previousInsight: sessionGoalState,
       });
@@ -542,7 +565,10 @@ async function main() {
       const summaryRangeStart = lastSummarizedEventId;
       lastSummarizedEventId = Math.max(lastSummarizedEventId, input.eventRangeEnd);
 
-      if (!shouldDisplay) return;
+      if (!shouldDisplay) {
+        // Even if not displayed, we count this range as summarized
+        return;
+      }
 
       store.saveSummary(message, summaryRangeStart, input.eventRangeEnd);
       lastSummary = { content: message, event_range_end: input.eventRangeEnd };
@@ -560,6 +586,7 @@ async function main() {
       }
     } finally {
       isSummarizing = false;
+      // Reset events count since we just performed a proactive summary
       eventsSinceLastSummary = store
         .getEventsSince(lastSummarizedEventId)
         .filter(isCountableEvent).length;
@@ -791,6 +818,13 @@ async function main() {
       event.change &&
       (typeof event.change.after === "string" || event.change.blocked)
     ) {
+      if (!event.change.blocked && event.change.before !== undefined) {
+        const linesBefore = event.change.before.split("\n").length;
+        const linesAfter = event.change.after?.split("\n").length ?? 0;
+        const diff = linesAfter - linesBefore;
+        const diffText = diff >= 0 ? `+${diff}` : `${diff}`;
+        ui.showInfo(`Diff detected in ${event.path} (${diffText} lines)`);
+      }
       try {
         store.upsertFile({
           path: event.path,
