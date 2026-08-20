@@ -21,9 +21,8 @@ No config files. No environment variables. Just run `chaves` and the wizard hand
 ### Prerequisites
 
 - **tmux** — for the split-pane mode (chat + dev terminal): `brew install tmux`
-- **Glow** — for markdown rendering: `brew install glow`
 
-If you skip these, CHAVES falls back to chat-only mode automatically.
+If tmux isn't installed, CHAVES falls back to chat-only mode automatically.
 
 ## Features
 

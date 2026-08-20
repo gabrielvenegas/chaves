@@ -113,7 +113,7 @@ export class Summarizer {
   constructor(options: SummarizerOptions = {}) {
     this.model = options.model ?? "anthropic/claude-3.5-haiku";
     this.language = options.language ?? "en";
-    this.apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY;
+    this.apiKey = options.apiKey ?? "";
     this.frequencyLevel = options.frequencyLevel ?? 2;
     this.personality = options.personality ?? "collaborative";
     this.thinkingEffort = options.thinkingEffort ?? "medium";
@@ -128,7 +128,7 @@ export class Summarizer {
     logger.debug("AI", `Using thinking effort: ${this.thinkingEffort}`);
 
     if (!this.apiKey) {
-      logger.warn("AI", "OPENROUTER_API_KEY not set - AI features will fail");
+      logger.warn("AI", "OpenRouter API key not set - AI features will fail");
     }
   }
 
@@ -139,7 +139,7 @@ export class Summarizer {
   private assertConfigured(): void {
     if (!this.apiKey?.trim()) {
       throw new Error(
-        "OpenRouter API key is not configured. Run /setup or set OPENROUTER_API_KEY.",
+        "OpenRouter API key is not configured. Run /setup to set your key.",
       );
     }
   }

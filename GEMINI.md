@@ -20,14 +20,13 @@
 - **Language**: TypeScript (Strict mode)
 - **AI Stack**: Vercel AI SDK (`ai`), OpenRouter Gateway
 - **Database**: SQLite (`better-sqlite3`)
-- **UI/UX**: `blessed` (TUI), `glow` (Markdown rendering), `chalk` (styling)
+- **UI/UX**: `blessed` (TUI), `chalk` (styling), built-in markdown renderer
 - **Tooling**: `chokidar` (watching), `diff` (patching/diffing), `tsx` (execution)
 
 ## Building and Running
 
 ### Prerequisites
-- [Glow](https://github.com/charmbracelet/glow) installed on the system for markdown rendering.
-- `OPENROUTER_API_KEY` set in your environment.
+- An OpenRouter API key (collected during onboarding, stored per-project in `.chaves.db`).
 
 ### Commands
 - `bun install`: Install project dependencies.
@@ -36,8 +35,7 @@
 - `bun run setup [project-path]`: Run the interactive model and language configuration wizard.
 - `bun run setup:project:path /path/to/project`: Targeted setup for a specific directory.
 
-### Environment Variables
-- `OPENROUTER_API_KEY`: **(Required)** API key for AI features.
+### Optional Environment Variables
 - `CHAVES_DEBUG`: Set to `true` for verbose logging.
 - `CHAVES_INDEX_ON_START`: Set to `false` to skip codebase indexing at startup.
 

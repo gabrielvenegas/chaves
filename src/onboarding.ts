@@ -6,7 +6,7 @@ import chalk from "chalk";
 import { ModelSetup } from "./modelSetup.js";
 import type { Store } from "./store.js";
 
-const CURRENT_ONBOARDING_VERSION = "1";
+const CURRENT_ONBOARDING_VERSION = "2";
 const ASCII_BANNER_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../chaves-ascii",
@@ -25,7 +25,6 @@ const theme = {
 
 type Readline = ReturnType<typeof createInterface>;
 type OnboardingResult = "completed" | "skipped" | "aborted";
-type InferenceMode = "managed" | "byok";
 type FrequencyLevel = "1" | "2" | "3";
 type Personality = "technical" | "collaborative" | "creative";
 
@@ -203,8 +202,6 @@ export async function runOnboardingIfNeeded(input: {
         "Chaves onboarding requires an interactive terminal.",
         "Run again in a TTY, or run:",
         `  bun run setup ${input.projectPath}`,
-        "",
-        "AI requires OPENROUTER_API_KEY (managed inference uses env; BYOK stores a per-project key).",
       ].join("\n"),
     );
     return "aborted";
@@ -213,11 +210,6 @@ export async function runOnboardingIfNeeded(input: {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
 
   try {
-    const existingInferenceMode = input.store.getConfigEnum(
-      "inference_mode",
-      ["managed", "byok"] as const,
-      "managed",
-    ) as InferenceMode;
     const existingApiKey = input.store.getConfig("openrouter_api_key")?.trim() ?? "";
     const existingModel = input.store.getModel();
     const existingLanguage = input.store.getLanguage();
@@ -233,7 +225,6 @@ export async function runOnboardingIfNeeded(input: {
     ) as Personality;
     const existingDevCommand = input.store.getConfig("dev_command")?.trim() ?? "";
 
-    let inferenceMode = existingInferenceMode;
     let apiKey = existingApiKey;
     let model = existingModel;
     let language = existingLanguage;
@@ -244,57 +235,22 @@ export async function runOnboardingIfNeeded(input: {
     printBanner(input.projectPath);
 
     printSection(
-      "Inference",
-      "Choose how Chaves should authenticate with OpenRouter for this project.",
+      "API key",
+      "Chaves uses your OpenRouter key, stored per-project inside .chaves.db.",
     );
-    printOption(
-      1,
-      "Managed inference",
-      "Uses your global OPENROUTER_API_KEY from the environment.",
-      {
-        isDefault: existingInferenceMode === "managed",
-        isCurrent: existingInferenceMode === "managed",
-      },
+    console.log(
+      theme.warning(
+        "Warning: the API key is stored in plaintext inside .chaves.db.",
+      ),
     );
-    printOption(
-      2,
-      "BYOK (Bring Your Own Key)",
-      "Stores a project-specific API key inside .chaves.db.",
-      {
-        isDefault: existingInferenceMode === "byok",
-        isCurrent: existingInferenceMode === "byok",
-      },
-    );
-    printOption(3, "Cancel onboarding", "Exit without changing settings.");
+    console.log(theme.muted("Do not commit or share that file.\n"));
 
-    const inferenceChoice = await promptChoice(
-      rl,
-      "Pick inference mode",
-      1,
-      3,
-      existingInferenceMode === "byok" ? 2 : 1,
-    );
-    if (inferenceChoice === 3) return "aborted";
-
-    inferenceMode = inferenceChoice === 2 ? "byok" : "managed";
-    if (inferenceMode === "byok") {
-      console.log("");
-      console.log(
-        theme.warning(
-          "Warning: the API key is stored in plaintext inside .chaves.db.",
-        ),
-      );
-      console.log(theme.muted("Do not commit or share that file.\n"));
-
-      apiKey = await promptNonEmptySecret(rl, "Enter OpenRouter API key", {
-        currentValue:
-          existingInferenceMode === "byok" && existingApiKey
-            ? existingApiKey
-            : undefined,
-      });
-    } else {
-      apiKey = "";
-    }
+    apiKey = await promptNonEmptySecret(rl, "Enter OpenRouter API key", {
+      currentValue: existingApiKey || undefined,
+      keepCurrentLabel: existingApiKey
+        ? "press Enter to keep current key"
+        : undefined,
+    });
 
     printSection(
       "Model",
@@ -455,11 +411,7 @@ export async function runOnboardingIfNeeded(input: {
           : normalized;
     }
 
-    input.store.setConfig("inference_mode", inferenceMode);
-    input.store.setConfig(
-      "openrouter_api_key",
-      inferenceMode === "byok" ? apiKey : "",
-    );
+    input.store.setConfig("openrouter_api_key", apiKey);
     input.store.setModel(model);
     input.store.setLanguage(language);
     input.store.setConfig("message_frequency_level", frequencyLevel);
@@ -473,12 +425,7 @@ export async function runOnboardingIfNeeded(input: {
     );
 
     printSection("Summary", "Saved settings for this project.");
-    printSummaryLine(
-      "Inference",
-      inferenceMode === "byok"
-        ? theme.text("BYOK (project key)")
-        : theme.text("Managed via OPENROUTER_API_KEY"),
-    );
+    printSummaryLine("API key", theme.text("Stored per-project"));
     printSummaryLine("Model", theme.text(model));
     printSummaryLine("Language", theme.text(language));
     printSummaryLine(

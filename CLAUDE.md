@@ -20,11 +20,10 @@ bun run dev                 # Hot reload (tsx watch)
 bun run setup [project-path] # Configure model/language
 ```
 
-First run triggers an interactive onboarding wizard. Pass `--onboarding` to re-run it.
+First run triggers an interactive onboarding wizard that collects your OpenRouter API key and stores it per-project. Pass `--onboarding` to re-run it.
 
-## Required Environment
+## Optional Environment
 
-- `OPENROUTER_API_KEY` — LLM access via OpenRouter (required)
 - `CHAVES_DEBUG=true` — verbose debug logging
 - `CHAVES_INDEX_ON_START=true` — index codebase at startup (default true)
 
@@ -68,7 +67,7 @@ Watcher (chokidar)
 - `messages` — chat history (role, channel, session_id)
 - `chat_summaries` — rolling conversation summaries
 - `files` — indexed project files with FTS5 virtual table
-- `config` — key/value store (model, language, inference_mode, frequency, personality)
+- `config` — key/value store (model, language, api key, frequency, personality)
 
 ## Security (Shield)
 
@@ -79,7 +78,7 @@ Three-layer protection applied at file blocking → content scanning → prompt 
 
 ## Configuration (stored in `.chaves.db`)
 
-- **inference_mode** — model selection mode
+- **openrouter_api_key** — stored OpenRouter API key (BYOK, per-project)
 - **model** — active LLM model ID
 - **language** — UI/output language
 - **message_frequency_level** — 1 (conservative), 2 (normal), 3 (aggressive)

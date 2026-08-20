@@ -387,16 +387,7 @@ async function main() {
     "collaborative",
   ) as Personality;
 
-  const inferenceMode = store.getConfigEnum(
-    "inference_mode",
-    ["managed", "byok"] as const,
-    "managed",
-  );
-  const storedKey = store.getConfig("openrouter_api_key")?.trim() ?? "";
-  const apiKey =
-    inferenceMode === "byok" && storedKey.length > 0
-      ? storedKey
-      : process.env.OPENROUTER_API_KEY;
+  const apiKey = store.getConfig("openrouter_api_key")?.trim() ?? "";
 
   const baseSummaryThreshold =
     frequencyLevel === 1 ? 20 : frequencyLevel === 3 ? 5 : 10;

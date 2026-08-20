@@ -154,12 +154,7 @@ function resolveModelSelection(rawValue: string): string | null {
 }
 
 function getActiveApiKey(store: Store): string {
-  const inferenceMode = store.getConfig("inference_mode")?.trim() ?? "managed";
-  if (inferenceMode === "byok") {
-    return store.getConfig("openrouter_api_key")?.trim() ?? "";
-  }
-
-  return process.env.OPENROUTER_API_KEY?.trim() ?? "";
+  return store.getConfig("openrouter_api_key")?.trim() ?? "";
 }
 
 function getModelCache(store: Store): OpenRouterModelSummary[] {
