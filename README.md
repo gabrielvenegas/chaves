@@ -1,108 +1,76 @@
-# CHAVES - Your AI Coding Companion
+# CHAVES
 
-CHAVES is an intelligent coding companion that brings real-time IDE activity monitoring, terminal awareness, and contextual AI assistance directly into your terminal. It watches your workflow, tracks file changes, and provides proactive summaries and debugging help in a high-performance Terminal UI.
+Your AI coding companion in the terminal. It watches what you code, understands your changes, and gives proactive help — summaries, debug insights, contextual chat — without leaving your workflow.
 
-## Features
-
-### 🛠️ Real-Time Activity Monitoring
-- **Intelligent Watcher**: Monitors your project for file creations, changes, and deletions with granular diff tracking.
-- **Proactive Insights**: Automatically infers your current goal and focus, suggesting the most logical next step before you even ask.
-
-### 🧠 Advanced AI & Memory
-- **Durable Session Memory**: Passive learning of your coding style and architectural preferences from chat history.
-- **Rolling Context Windows**: Compact conversation summaries to maintain long-term memory while keeping AI response times fast.
-- **Multi-Model Support**: Powered by OpenRouter, supporting Claude 3.5, GPT-4, and more.
-
-### 📟 Terminal & tmux Mastery
-- **Integrated Dev Shell**: Bootstraps a managed **tmux session** with a split-pane layout (Chat + Dev Terminal).
-- **Environment Awareness**: Spawns dev commands in your project's native login shell, preserving all environment variables and aliases.
-- **Real-Time Terminal Relay**: Automatically captures and stores stdout/stderr output for proactive error analysis and debugging.
-
-### 📂 Deep Search & Security
-- **DB-Backed Code Search**: Project-wide search across indexed files using SQLite's FTS5 engine.
-- **Shield Protection**: Built-in security layer to block sensitive files and redact API keys before they reach the LLM.
-
-## Installation
-
-### From npm (when published)
+## Quick Start
 
 ```bash
 npm install -g chaves
+chaves
 ```
 
-Then run from any project:
+That's it. On first run, an interactive wizard walks you through:
 
-```bash
-chaves [project-path]
-```
+- **API key** — paste your [OpenRouter](https://openrouter.ai) key (stored locally per project)
+- **Model** — pick from Claude, GPT-4, and more
+- **Language** — responses in your preferred language
+- **Dev command** — optional: your `npm run dev` / `bun dev` / etc. for terminal capture
 
-### From source
+No config files. No environment variables. Just run `chaves` and the wizard handles the rest.
 
-```bash
-git clone https://github.com/gabrielvenegas/chaves.git
-cd chaves
-bun install
-```
+### Prerequisites
 
-### Install Glow (Markdown Renderer)
-CHAVES uses [Glow](https://github.com/charmbracelet/glow) to render markdown summaries. Install it on your system:
+- **tmux** — for the split-pane mode (chat + dev terminal): `brew install tmux`
+- **Glow** — for markdown rendering: `brew install glow`
 
-**macOS:** `brew install glow`
-**Others:** See [Glow Installation](https://github.com/charmbracelet/glow)
+If you skip these, CHAVES falls back to chat-only mode automatically.
+
+## Features
+
+**Real-time monitoring** — Watches file changes, calculates diffs, and tracks your activity as you code.
+
+**Proactive insights** — Infers your current goal and suggests the next logical step before you ask.
+
+**Contextual chat** — Ask questions about your codebase. CHAVES knows what you've changed, what errors appeared in your terminal, and where to look.
+
+**Terminal awareness** — Captures dev server output (stdout/stderr) and proactively flags errors and stack traces.
+
+**Codebase search** — Full-text search across your indexed files via SQLite FTS5.
+
+**Session memory** — Learns your preferences and architectural decisions across conversations.
+
+**Security shield** — Blocks sensitive files (`.env`, keys, credentials) and redacts API keys before anything reaches the LLM. Always on, zero config.
 
 ## Usage
 
-### Basic Usage
 ```bash
-chaves [project-path]
-```
-If no path is provided, CHAVES will watch the current directory.
-
-Use `--chat-only` to skip the managed tmux split and run in chat-only mode:
-
-```bash
-chaves --chat-only [project-path]
+chaves                    # Watch current directory
+chaves /path/to/project   # Watch a specific project
+chaves --chat-only        # Skip tmux split, chat only
 ```
 
-`--standalone` is also accepted as a compatibility alias.
+### Chat Commands
 
-### From source (development)
-```bash
-bun start [project-path]    # Run via tsx
-bun run dev                 # Hot reload (tsx watch)
-```
+Type these directly in the chat:
 
-### Interactive Commands
-Query context directly from the chat:
-- `/help` - Show all commands
-- `/setup` - Configure models and languages
-- `/model list` - Browse available OpenRouter models
-- `/history [n]` - Review recent chat history
-- `/diffs [n]` - See the last `n` diff snapshots
-- `/diff <id>` - Inspect a specific code change by ID
+- `/help` — show all commands
+- `/setup` — reconfigure model, language, or dev command
+- `/model list` — browse available models
+- `/history [n]` — review recent chat history
+- `/diffs [n]` — see recent code changes
+- `/diff <id>` — inspect a specific change
 
-## Environment Variables
+### Keyboard Shortcuts
 
-- `OPENROUTER_API_KEY`: **(Required)** Your OpenRouter API key.
-- `CHAVES_DEBUG`: Set to `"true"` for detailed operation logs.
-- `CHAVES_INDEX_ON_START`: Set to `"false"` to skip codebase indexing at startup.
+- `Ctrl+H` or `?` — show all shortcuts (in-app)
+- `Alt+1`–`Alt+4` — filter by message type (all / chat / insights / logs)
+- `Ctrl+T` — cycle theme
+- `Ctrl+L` — toggle between chat and dev pane
 
-## Roadmap
+## Data
 
-### 1. 🔍 Semantic Search with Local Embeddings
-Move beyond simple keyword matching. We are planning to replace or augment FTS5 with a local vector index so CHAVES can find code by meaning. This will improve vague queries like "where is the auth flow?" or "how do I add a new command?".
-
-### 2. 🪲 Automated Debugging Workflows
-Leveraging the tmux relay to proactively detect errors and stack traces. CHAVES will analyze failing runs, locate the likely buggy files, and suggest a fix in the chat pane automatically.
-
-### 3. ⚡ High-Performance Intelligent Tracking
-Building model-agnostic change tracking that is even more surgical. We aim to optimize how changes are summarized and presented to the LLM, ensuring the highest context quality with minimum token consumption, regardless of which model you choose.
-
-### 4. 🤖 Autonomous Proactivity
-Transitioning from a passive "assistant" to an active "agent." This includes enabling CHAVES to perform multi-step research tasks and code validation when granted permission, effectively becoming a collaborative peer programmer that works while you think.
+Everything is stored locally in a `.chaves.db` SQLite file inside your project. Chat history, diffs, events, and settings are per-project. Add `.chaves.db` to `.gitignore` (it's ignored by default).
 
 ## License
-MIT
 
----
-Built with Bun, SQLite, Vercel AI SDK, and OpenRouter.
+MIT
