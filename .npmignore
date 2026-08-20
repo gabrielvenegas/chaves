@@ -1,0 +1,15 @@
+# Development-only files excluded from the published package.
+# The "files" allowlist in package.json is the primary control and takes
+# precedence; this is a safety net for stray files at the root.
+node_modules
+scripts
+tests
+*.log
+.chaves.db
+.chaves-cs-storefront.db
+todo.md
+listen_terminal_poc.md
+SHIELD.md
+CLAUDE.md
+GEMINI.md
+AGENTS.md

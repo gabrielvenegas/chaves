@@ -87,6 +87,16 @@ export const CHAT_COMMANDS: readonly ChatCommandDefinition[] = [
     description: "Show a saved diff snapshot by id.",
   },
   {
+    command: "/failures",
+    usage: "/failures [n]",
+    description: "List recent debug incidents.",
+  },
+  {
+    command: "/failure",
+    usage: "/failure <id>",
+    description: "Show a stored debug incident by id.",
+  },
+  {
     command: "/clear",
     usage: "/clear",
     description: "Clear chat and runtime context, but keep indexed files.",
@@ -117,6 +127,17 @@ function parseLimit(input: string | undefined, fallback: number): number {
 function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}\n... [truncated ${value.length - maxChars} chars]`;
+}
+
+function parseRelatedFilesJson(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function resolveModelSelection(rawValue: string): string | null {
@@ -690,6 +711,54 @@ export async function handleSlashCommand(
         "Prompt:",
         truncate(snapshot.prompt, 2500),
         ].join("\n"),
+      };
+    }
+
+    case "/failures": {
+      const limit = parseLimit(args[0], 10);
+      const incidents = store.listDebugIncidents(limit);
+      if (incidents.length === 0) return { output: "No debug incidents found." };
+      return {
+        output: [
+          `Last ${incidents.length} debug incidents:`,
+          ...incidents.map(
+            (incident) =>
+              `- #${incident.id} ${incident.timestamp} [${incident.status}] ${incident.headline}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/failure": {
+      const id = Number.parseInt(args[0] ?? "", 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return { output: "Usage: /failure <id>" };
+      }
+      const incident = store.getDebugIncidentById(id);
+      if (!incident) return { output: `Debug incident #${id} not found.` };
+      const relatedFiles = parseRelatedFilesJson(incident.related_files_json);
+      const lines = [
+        `Failure #${incident.id}`,
+        `timestamp: ${incident.timestamp}`,
+        `status: ${incident.status}`,
+        `trigger: ${incident.trigger}`,
+      ];
+      if (incident.exit_code !== null) {
+        lines.push(`exit_code: ${incident.exit_code}`);
+      }
+      if (incident.signal) {
+        lines.push(`signal: ${incident.signal}`);
+      }
+      if (incident.diff_snapshot_id !== null) {
+        lines.push(`diff_snapshot_id: ${incident.diff_snapshot_id}`);
+      }
+      lines.push("", `Headline: ${incident.headline}`, "", "Diagnosis:", incident.summary || "(pending)");
+      if (relatedFiles.length > 0) {
+        lines.push("", `Related files: ${relatedFiles.join(", ")}`);
+      }
+      lines.push("", "Log excerpt:", truncate(incident.log_excerpt, 2500));
+      return {
+        output: lines.join("\n"),
       };
     }
 

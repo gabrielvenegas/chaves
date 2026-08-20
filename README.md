@@ -24,7 +24,23 @@ CHAVES is an intelligent coding companion that brings real-time IDE activity mon
 
 ## Installation
 
+### From npm (when published)
+
 ```bash
+npm install -g chaves
+```
+
+Then run from any project:
+
+```bash
+chaves [project-path]
+```
+
+### From source
+
+```bash
+git clone https://github.com/gabrielvenegas/chaves.git
+cd chaves
 bun install
 ```
 
@@ -38,9 +54,23 @@ CHAVES uses [Glow](https://github.com/charmbracelet/glow) to render markdown sum
 
 ### Basic Usage
 ```bash
-bun start [project-path]
+chaves [project-path]
 ```
 If no path is provided, CHAVES will watch the current directory.
+
+Use `--chat-only` to skip the managed tmux split and run in chat-only mode:
+
+```bash
+chaves --chat-only [project-path]
+```
+
+`--standalone` is also accepted as a compatibility alias.
+
+### From source (development)
+```bash
+bun start [project-path]    # Run via tsx
+bun run dev                 # Hot reload (tsx watch)
+```
 
 ### Interactive Commands
 Query context directly from the chat:

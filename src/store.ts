@@ -22,7 +22,7 @@ export interface ActivityEvent {
 }
 
 export type MessageRole = "user" | "assistant" | "system";
-export type MessageChannel = "chat" | "proactive" | "error" | "info";
+export type MessageChannel = "chat" | "proactive" | "debug" | "error" | "info";
 
 export interface StoredMessage {
   id: number;
@@ -79,6 +79,24 @@ export interface TerminalEventRecord {
   timestamp: string;
   stream: "stdout" | "stderr";
   data: string;
+}
+
+export type DebugIncidentStatus = "open" | "dismissed";
+
+export interface DebugIncident {
+  id: number;
+  timestamp: string;
+  status: DebugIncidentStatus;
+  fingerprint: string;
+  trigger: string;
+  exit_code: number | null;
+  signal: string | null;
+  headline: string;
+  summary: string;
+  log_excerpt: string;
+  related_files_json: string;
+  event_range_end: number | null;
+  diff_snapshot_id: number | null;
 }
 
 interface RecentMessageOptions {
@@ -189,6 +207,21 @@ export class Store {
         stream TEXT NOT NULL,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS debug_incidents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        status TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        exit_code INTEGER,
+        signal TEXT,
+        headline TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        log_excerpt TEXT NOT NULL,
+        related_files_json TEXT NOT NULL,
+        event_range_end INTEGER,
+        diff_snapshot_id INTEGER
+      );
       CREATE TABLE IF NOT EXISTS working_memory (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -199,6 +232,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_chat_summaries_range ON chat_summaries(message_range_end);
       CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
       CREATE INDEX IF NOT EXISTS idx_terminal_events_timestamp ON terminal_events(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_debug_incidents_timestamp ON debug_incidents(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_debug_incidents_fingerprint ON debug_incidents(fingerprint);
     `);
 
     try {
@@ -501,6 +536,7 @@ export class Store {
       "diff_snapshots",
       "events",
       "terminal_events",
+      "debug_incidents",
     ] as const;
 
     const transaction = this.db.transaction(() => {
@@ -721,6 +757,155 @@ export class Store {
     return this.db
       .prepare(`SELECT * FROM terminal_events ORDER BY id DESC LIMIT ?`)
       .all(safeLimit) as TerminalEventRecord[];
+  }
+
+  getTerminalEventsSince(id: number, limit = 500): TerminalEventRecord[] {
+    const safeLimit = Math.max(1, Math.min(limit, 1000));
+    return this.db
+      .prepare(
+        `
+      SELECT * FROM terminal_events
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT ?
+    `,
+      )
+      .all(id, safeLimit) as TerminalEventRecord[];
+  }
+
+  createDebugIncident(input: {
+    status?: DebugIncidentStatus;
+    fingerprint: string;
+    trigger: string;
+    exitCode?: number | null;
+    signal?: string | null;
+    headline?: string;
+    summary?: string;
+    logExcerpt: string;
+    relatedFiles?: string[];
+    eventRangeEnd?: number | null;
+    diffSnapshotId?: number | null;
+  }): DebugIncident {
+    const timestamp = new Date().toISOString();
+    const status = input.status ?? "open";
+    const fingerprint = shield.sanitize(input.fingerprint.trim());
+    const trigger = shield.sanitize(input.trigger.trim());
+    const headline = shield.sanitize((input.headline ?? "Debug incident detected").trim());
+    const summary = shield.sanitize((input.summary ?? "").trim());
+    const logExcerpt = shield.sanitize(input.logExcerpt);
+    const relatedFilesJson = JSON.stringify(
+      [...new Set((input.relatedFiles ?? []).map((value) => value.trim()).filter(Boolean))].slice(0, 3),
+    );
+
+    const result = this.db
+      .prepare(
+        `
+      INSERT INTO debug_incidents (
+        timestamp,
+        status,
+        fingerprint,
+        trigger,
+        exit_code,
+        signal,
+        headline,
+        summary,
+        log_excerpt,
+        related_files_json,
+        event_range_end,
+        diff_snapshot_id
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+      )
+      .run(
+        timestamp,
+        status,
+        fingerprint,
+        trigger,
+        input.exitCode ?? null,
+        input.signal ?? null,
+        headline,
+        summary,
+        logExcerpt,
+        relatedFilesJson,
+        input.eventRangeEnd ?? null,
+        input.diffSnapshotId ?? null,
+      );
+
+    return {
+      id: Number(result.lastInsertRowid),
+      timestamp,
+      status,
+      fingerprint,
+      trigger,
+      exit_code: input.exitCode ?? null,
+      signal: input.signal ?? null,
+      headline,
+      summary,
+      log_excerpt: logExcerpt,
+      related_files_json: relatedFilesJson,
+      event_range_end: input.eventRangeEnd ?? null,
+      diff_snapshot_id: input.diffSnapshotId ?? null,
+    };
+  }
+
+  updateDebugIncidentDiagnosis(input: {
+    id: number;
+    headline: string;
+    summary: string;
+    relatedFiles?: string[];
+    status?: DebugIncidentStatus;
+  }): void {
+    const relatedFilesJson = JSON.stringify(
+      [...new Set((input.relatedFiles ?? []).map((value) => value.trim()).filter(Boolean))].slice(0, 3),
+    );
+
+    this.db
+      .prepare(
+        `
+      UPDATE debug_incidents
+      SET status = ?,
+          headline = ?,
+          summary = ?,
+          related_files_json = ?
+      WHERE id = ?
+    `,
+      )
+      .run(
+        input.status ?? "open",
+        shield.sanitize(input.headline.trim()),
+        shield.sanitize(input.summary.trim()),
+        relatedFilesJson,
+        input.id,
+      );
+  }
+
+  listDebugIncidents(limit = 10): DebugIncident[] {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const rows = this.db
+      .prepare(`SELECT * FROM debug_incidents ORDER BY id DESC LIMIT ?`)
+      .all(safeLimit) as DebugIncident[];
+    return rows.map((row) => ({
+      ...row,
+      headline: shield.sanitize(row.headline),
+      summary: shield.sanitize(row.summary),
+      log_excerpt: shield.sanitize(row.log_excerpt),
+      related_files_json: row.related_files_json,
+    }));
+  }
+
+  getDebugIncidentById(id: number): DebugIncident | null {
+    const row = this.db
+      .prepare(`SELECT * FROM debug_incidents WHERE id = ? LIMIT 1`)
+      .get(id) as DebugIncident | undefined;
+    if (!row) return null;
+    return {
+      ...row,
+      headline: shield.sanitize(row.headline),
+      summary: shield.sanitize(row.summary),
+      log_excerpt: shield.sanitize(row.log_excerpt),
+      related_files_json: row.related_files_json,
+    };
   }
 
   getModel(): string {

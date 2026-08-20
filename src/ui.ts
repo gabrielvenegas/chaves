@@ -3,7 +3,7 @@ import { CHAT_COMMANDS, PRIMARY_CHAT_COMMANDS } from "./chatCommands.js";
 import { logger } from "./logger.js";
 import type { ThemeName } from "./theme.js";
 import type { ActivityEvent, TerminalEventRecord } from "./store.js";
-import { createChatUI, type ChatMessage, type ChatUI } from "./ui/chat.js";
+import { createChatUI, type ChatMessage, type ChatMessageChannel, type ChatUI } from "./ui/chat.js";
 
 type UserMessageHandler = (text: string) => Promise<void> | void;
 
@@ -43,6 +43,7 @@ export class UI {
         role: "user",
         content: text,
         timestamp: Date.now(),
+        channel: "chat",
       });
 
       try {
@@ -116,7 +117,7 @@ export class UI {
     return this.chat.pushMessage(message);
   }
 
-  async showAssistantMessage(content: string) {
+  async showAssistantMessage(content: string, channel: ChatMessageChannel = "chat") {
     try {
       const rendered = await this.markdownRenderer.render(content);
       const formatted = `${rendered}`.trim();
@@ -125,6 +126,7 @@ export class UI {
           role: "assistant",
           content: formatted,
           timestamp: Date.now(),
+          channel,
         });
       }
     } catch (error) {
@@ -137,6 +139,7 @@ export class UI {
         role: "assistant",
         content: `${content}`.trim(),
         timestamp: Date.now(),
+        channel,
       });
     }
   }
@@ -150,6 +153,7 @@ export class UI {
         content: formatted.length > 0 ? formatted : content.trim(),
         timestamp: Date.now(),
         transient: false,
+        channel: "chat",
       });
     } catch (error) {
       logger.error(
@@ -162,6 +166,7 @@ export class UI {
         content: `${content}`.trim(),
         timestamp: Date.now(),
         transient: false,
+        channel: "chat",
       });
     }
   }
@@ -175,7 +180,7 @@ export class UI {
     logger.debug("UI", `Showing new summary (${summary.length} chars)`);
     this.lastSummary = summary;
 
-    await this.showAssistantMessage(summary);
+    await this.showAssistantMessage(summary, "proactive");
 
     this.eventBuffer = [];
   }
@@ -186,6 +191,7 @@ export class UI {
       role: "system",
       content: `Watching project: ${projectPath}`,
       timestamp: Date.now(),
+      channel: "system",
     });
   }
 
@@ -196,6 +202,7 @@ export class UI {
       role: "system",
       content: `❌ ${message}${details}`,
       timestamp: Date.now(),
+      channel: "system",
     });
   }
 
@@ -205,6 +212,7 @@ export class UI {
       role: "system",
       content: `ℹ️ ${message}`,
       timestamp: Date.now(),
+      channel: "system",
     });
   }
 
@@ -214,6 +222,7 @@ export class UI {
       role: "system",
       content: `✅ ${message}`,
       timestamp: Date.now(),
+      channel: "system",
     });
   }
 
@@ -235,6 +244,7 @@ export class UI {
       content,
       timestamp: Date.now(),
       transient: true,
+      channel: "system",
     });
   }
 
@@ -252,6 +262,7 @@ export class UI {
       content: initialContent,
       timestamp: Date.now(),
       transient: true,
+      channel: "chat",
     });
   }
 

@@ -7,12 +7,31 @@ import { THEMES, type ThemeDefinition, type ThemeName } from "../theme.js";
 
 export type ChatMessageRole = "user" | "assistant" | "system" | "progress";
 
+/**
+ * Logical channel a message belongs to. The store tracks richer channels
+ * ("chat" | "proactive" | "debug" | "error" | "info") and we mirror that here
+ * so the UI can filter by channel with Alt+1..4.
+ *
+ *  - "chat"       : user questions and direct assistant replies
+ *  - "proactive" : unsolicited proactive insights / summaries
+ *  - "debug"     : debug incident diagnoses
+ *  - "log"       : terminal relay output (stdout/stderr)
+ *  - "system"    : welcome, errors, info banners (default for pushMessage)
+ */
+export type ChatMessageChannel =
+  | "chat"
+  | "proactive"
+  | "debug"
+  | "log"
+  | "system";
+
 export interface ChatMessage {
   id?: string;
   role: ChatMessageRole;
   content: string;
   timestamp?: number;
   transient?: boolean;
+  channel?: ChatMessageChannel;
 }
 
 export interface ChatUIOptions {
@@ -51,6 +70,7 @@ interface MessageRecord {
   transient: boolean;
   isLog: boolean;
   logStream?: "stdout" | "stderr";
+  channel: ChatMessageChannel;
 }
 
 const ESC = "\x1b";
@@ -189,6 +209,26 @@ function roleColor(role: ChatMessageRole, theme: ThemeDefinition): string {
   }[role];
 }
 
+/**
+ * Whether a message channel should be visible under the given filter.
+ * "all" shows everything. Otherwise an exact channel match is required.
+ */
+function channelIncludes(
+  filter: ChatMessageChannel | "all",
+  channel: ChatMessageChannel,
+): boolean {
+  return filter === "all" || filter === channel;
+}
+
+const CHANNEL_LABELS: Record<ChatMessageChannel | "all", string> = {
+  all: "all",
+  chat: "chat",
+  proactive: "insights",
+  debug: "debug",
+  log: "terminal",
+  system: "system",
+};
+
 export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   let theme = THEMES[options.theme ?? "warm"];
   let statusText = options.initialStatus ?? "Watching…";
@@ -205,6 +245,10 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   const messages: MessageRecord[] = [];
   let cachedLines: string[] | null = null;
   let cachedCols = 0;
+
+  // Channel filter state. "all" shows everything; Alt+1..4 switch.
+  let activeChannel: ChatMessageChannel | "all" = "all";
+  let showHelp = false;
 
   let scrollOffset = 0;
   let unreadCount = 0;
@@ -456,7 +500,11 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
   function getLines(): string[] {
     if (cachedLines === null || cachedCols !== cols) {
       const result: string[] = [];
-      for (const msg of messages) result.push(...renderMessageToLines(msg));
+      for (const msg of messages) {
+        if (channelIncludes(activeChannel, msg.channel)) {
+          result.push(...renderMessageToLines(msg));
+        }
+      }
       cachedLines = result;
       cachedCols = cols;
     }
@@ -486,8 +534,10 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     const dot = chalk.hex(theme.muted)("·");
     const status = chalk.hex(theme.status).bold(statusText.replace(/\s+/g, " ").trim());
     const rt = runtimeInfo ? `  ${dot}  ${chalk.hex(theme.muted)(runtimeInfo)}` : "";
+    const chLabel = activeChannel === "all" ? "all" : CHANNEL_LABELS[activeChannel];
+    const channelTag = chalk.hex(theme.muted)(`#${chLabel}`);
     return truncateVisible(
-      `  ${chalk.hex(theme.assistant).bold("chaves")}  ${dot}  ${status}${rt}`,
+      `  ${chalk.hex(theme.assistant).bold("chaves")}  ${dot}  ${status}${rt}  ${dot}  ${channelTag}`,
       iw(),
     );
   }
@@ -514,6 +564,53 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       row: inputStartRow() + cursorRow,
       col: 6 + (cursorCol - viewStart),
     };
+  }
+
+  function renderHelpOverlay(): string {
+    const inner = Math.max(20, cols - 4);
+    const entries: Array<[string, string]> = [
+      ["Ctrl+L", "Toggle Chat / Dev pane"],
+      ["Ctrl+C / Ctrl+Q", "Quit CHAVES"],
+      ["Ctrl+R", "Force refresh / re-index"],
+      ["Ctrl+T", "Cycle theme"],
+      ["Ctrl+H / ?", "Toggle this help"],
+      ["Ctrl+K", "Clear input draft"],
+      ["Ctrl+U", "Clear current line"],
+      ["PageUp / PageDown", "Scroll history"],
+      ["Up / Down", "Scroll (blank draft) / picker"],
+      ["Home / End", "Cursor to line start / end"],
+      ["g / G", "Jump bottom / top (blank draft)"],
+      ["Alt+Enter / Ctrl+J", "Insert newline"],
+      ["Esc", "Reset scroll + close help"],
+      ["Alt+1", "All messages"],
+      ["Alt+2", "Chat only"],
+      ["Alt+3", "Proactive insights"],
+      ["Alt+4", "Terminal logs"],
+    ];
+    const labelW = Math.max(...entries.map((e) => e[0].length)) + 2;
+    const lines: string[] = [];
+    lines.push(chalk.hex(theme.border)(`┌${"─".repeat(inner + 2)}┐`));
+    const title = "Keyboard Shortcuts";
+    const titleText = chalk.hex(theme.assistant).bold(title);
+    const titleVis = visibleLength(title);
+    const tPad = Math.max(0, Math.floor((inner + 2 - titleVis) / 2));
+    const tRight = Math.max(0, inner + 2 - tPad - titleVis);
+    lines.push(
+      chalk.hex(theme.border)("│") +
+        " ".repeat(tPad) + titleText + " ".repeat(tRight) +
+        chalk.hex(theme.border)("│"),
+    );
+    lines.push(chalk.hex(theme.border)(`├${"─".repeat(inner + 2)}┤`));
+    for (const [combo, desc] of entries) {
+      const key = chalk.hex(theme.assistant).bold(combo.padEnd(labelW));
+      const rest = desc.slice(0, Math.max(0, inner - labelW));
+      const content = ` ${key}${rest}`;
+      lines.push(
+        chalk.hex(theme.border)("│") + padToWidth(content, inner + 2) + chalk.hex(theme.border)("│"),
+      );
+    }
+    lines.push(chalk.hex(theme.border)(`└${"─".repeat(inner + 2)}┘`));
+    return lines.join("\r\n");
   }
 
   function renderAll() {
@@ -607,6 +704,10 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     buf.push(contentRow(statusText_(), cols, theme), "\r\n");
     buf.push(bottomBorder(cols, theme));
 
+    if (showHelp) {
+      buf.push("\r\n", renderHelpOverlay());
+    }
+
     clampCursor();
     const cursor = cursorPosition();
     buf.push(moveTo(cursor.row, isDraftBlank() ? 6 : cursor.col));
@@ -665,6 +766,61 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       return;
     }
 
+    if (key.ctrl && key.name === "u") {
+      draftLines[cursorRow] = "";
+      cursorCol = 0;
+      await updateMatchingCommands();
+      scheduleRender();
+      return;
+    }
+
+    if (key.ctrl && key.name === "q") {
+      process.kill(process.pid, "SIGINT");
+      return;
+    }
+
+    if (key.ctrl && key.name === "h") {
+      showHelp = !showHelp;
+      scheduleRender();
+      return;
+    }
+
+    const altDigit = key.meta
+      ? key.name
+      : key.sequence?.match(/^\x1b([1-4])$/)?.[1];
+    if (altDigit === "1") {
+      activeChannel = "all";
+      scrollOffset = 0;
+      unreadCount = 0;
+      invalidate();
+      scheduleRender();
+      return;
+    }
+    if (altDigit === "2") {
+      activeChannel = "chat";
+      scrollOffset = 0;
+      unreadCount = 0;
+      invalidate();
+      scheduleRender();
+      return;
+    }
+    if (altDigit === "3") {
+      activeChannel = "proactive";
+      scrollOffset = 0;
+      unreadCount = 0;
+      invalidate();
+      scheduleRender();
+      return;
+    }
+    if (altDigit === "4") {
+      activeChannel = "log";
+      scrollOffset = 0;
+      unreadCount = 0;
+      invalidate();
+      scheduleRender();
+      return;
+    }
+
     if (key.name === "prior" || key.name === "pageup") {
       scrollOffset += effectiveVH();
       scheduleRender();
@@ -676,8 +832,18 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       return;
     }
     if (key.name === "escape") {
-      scrollOffset = 0;
-      unreadCount = 0;
+      if (showHelp) {
+        showHelp = false;
+      } else {
+        scrollOffset = 0;
+        unreadCount = 0;
+      }
+      scheduleRender();
+      return;
+    }
+
+    if (isDraftBlank() && ch === "?") {
+      showHelp = !showHelp;
       scheduleRender();
       return;
     }
@@ -842,12 +1008,13 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       timestamp: message.timestamp ?? Date.now(),
       transient: message.transient ?? false,
       isLog: false,
+      channel: message.channel ?? "system",
     };
     messages.push(rec);
 
     if (scrollOffset > 0) {
       scrollOffset += renderMessageToLines(rec).length;
-      unreadCount++;
+      if (channelIncludes(activeChannel, rec.channel)) unreadCount++;
     }
 
     invalidate();
@@ -862,6 +1029,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     if (patch.role !== undefined) rec.role = patch.role;
     if (patch.transient !== undefined) rec.transient = patch.transient;
     if (patch.timestamp !== undefined) rec.timestamp = patch.timestamp;
+    if (patch.channel !== undefined) rec.channel = patch.channel;
     invalidate();
     scheduleRender();
   }
@@ -884,6 +1052,7 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       transient: false,
       isLog: true,
       logStream: stream,
+      channel: "log",
     });
     invalidate();
     scheduleRender();

@@ -3,15 +3,30 @@ import { spawnSync } from "child_process";
 import { mkdirSync, rmSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import { logger } from "./logger.js";
 
 const TMUX_BINARY = "tmux";
 const TMUX_SESSION_NAME = "chaves";
 const DEFAULT_LOGIN_SHELL = "/bin/zsh";
-const ENTRY_SCRIPT_PATH = resolve(
+const PACKAGE_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
-  "./index.ts",
+  "..",
 );
+const ENTRY_SCRIPT_PATH = resolve(PACKAGE_ROOT, "src", "index.ts");
+
+// createRequire gives us CJS require.resolve, which walks the node_modules
+// tree from this file's location — robust against npm hoisting in global installs.
+const moduleRequire = createRequire(import.meta.url);
+
+/**
+ * Resolve the tsx CLI entrypoint from this package's dependencies.
+ * Uses Node's module resolution so it works whether chaves is run from a
+ * local checkout, installed globally (with hoisted deps), or via npx.
+ */
+function resolveTsxRuntime(): string {
+  return moduleRequire.resolve("tsx/cli");
+}
 
 export interface TmuxBootstrapContext {
   projectPath: string;
@@ -97,11 +112,9 @@ function buildBaseRuntimeArgv(): string[] {
     return [process.execPath, ENTRY_SCRIPT_PATH];
   }
 
-  // Use the tsx binary from chaves's own node_modules so the command works
-  // regardless of the target project's CWD (the target project won't have tsx).
-  const chavesRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const tsxBin = resolve(chavesRoot, "node_modules", ".bin", "tsx");
-  return [tsxBin, ENTRY_SCRIPT_PATH];
+  // Under Node, run the entry via tsx so TypeScript is handled at runtime.
+  // Resolve tsx from chaves's own package deps (not the target project's).
+  return [process.execPath, resolveTsxRuntime(), ENTRY_SCRIPT_PATH];
 }
 
 function buildEnvPrefix(env: Record<string, string>): string {

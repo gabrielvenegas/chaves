@@ -25,6 +25,7 @@ import {
   type ActivityEvent,
   type MessageRole,
   type StoredMessage,
+  type TerminalEventRecord,
 } from "./store.js";
 import {
   isInsideManagedTmuxSession,
@@ -41,6 +42,18 @@ const INDEX_MAX_FILE_SIZE = parseEnvInt(
 );
 const CHAT_CONTEXT_MESSAGES = parseEnvInt("CHAVES_CHAT_CONTEXT_MESSAGES", 20);
 const CHAT_SUMMARY_THRESHOLD = parseEnvInt("CHAVES_CHAT_SUMMARY_THRESHOLD", 40);
+const TERMINAL_BUFFER_LIMIT = 200;
+const TERMINAL_INCIDENT_EXCERPT_LINES = 80;
+const TERMINAL_FINGERPRINT_LINES = 20;
+const TERMINAL_POLL_BATCH_SIZE = 200;
+const DEBUG_INCIDENT_DEDUPE_WINDOW_MS = 5 * 60 * 1000;
+const DEBUG_ERROR_BURST_DEBOUNCE_MS = 1500;
+const PROACTIVE_DEBUG_COOLDOWN_MS = 15_000;
+const FATAL_TERMINAL_PATTERNS = [
+  /\b(?:error|exception|panic|traceback)\b/i,
+  /\b(?:module not found|cannot find module|failed to compile|build failed)\b/i,
+  /\b(?:uncaught|syntaxerror|typeerror|referenceerror)\b/i,
+];
 
 function parseEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -104,6 +117,20 @@ interface SessionGoalState extends SessionGoalContext {
   updatedAt: number;
 }
 
+interface PendingDebugIncident {
+  incidentId: number;
+  fingerprint: string;
+  trigger: string;
+  exitCode: number | null;
+  signal: string | null;
+  logExcerpt: string;
+  candidateFiles: string[];
+  recentEvents: ActivityEvent[];
+  eventRangeEnd: number | null;
+  diffSnapshotId: number | null;
+  diffSummary?: string;
+}
+
 function normalizeRelatedFiles(paths: string[]): string[] {
   return [...new Set(paths.map((path) => path.trim()).filter(Boolean))].slice(0, 3);
 }
@@ -120,6 +147,117 @@ function buildProactiveMessage(insight: ProactiveInsight): string {
   }
 
   return sections.join("\n\n");
+}
+
+function buildDebugIncidentMessage(input: {
+  headline: string;
+  summary: string;
+  relatedFiles: string[];
+}): string {
+  const sections = [
+    `**Debug Incident**\n${input.headline}`,
+    input.summary.trim(),
+  ];
+
+  const relatedFiles = normalizeRelatedFiles(input.relatedFiles);
+  if (relatedFiles.length > 0) {
+    sections.push(`**Related Files**\n${relatedFiles.join(", ")}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+function normalizeTerminalFingerprintLine(line: string): string {
+  return line
+    .toLowerCase()
+    .replace(/\b\d+\b/g, "#")
+    .replace(/0x[0-9a-f]+/gi, "0x#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isFatalTerminalLine(line: string): boolean {
+  if (/\bwarning\b/i.test(line)) return false;
+  return FATAL_TERMINAL_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+function parseManagedFailureTrigger(line: string): {
+  trigger: string;
+  exitCode: number | null;
+  signal: string | null;
+} | null {
+  const exitMatch = line.match(/^\[chaves\] dev command exited \(code: (-?\d+)\)$/);
+  if (exitMatch) {
+    const exitCode = Number.parseInt(exitMatch[1] ?? "", 10);
+    if (Number.isFinite(exitCode) && exitCode !== 0) {
+      return {
+        trigger: `dev command exited with code ${exitCode}`,
+        exitCode,
+        signal: null,
+      };
+    }
+    return null;
+  }
+
+  const signalMatch = line.match(/^\[chaves\] process exited \(signal: ([^)]+)\)$/);
+  if (signalMatch) {
+    return {
+      trigger: `dev command exited with signal ${signalMatch[1]}`,
+      exitCode: null,
+      signal: signalMatch[1] ?? null,
+    };
+  }
+
+  return null;
+}
+
+function isBuildFailureLine(line: string): boolean {
+  return (
+    /\[error\]/i.test(line) ||
+    /\bbuild failed\b/i.test(line) ||
+    /\bfailed with \d+ error\b/i.test(line) ||
+    /\bexpected .+ but found\b/i.test(line) ||
+    /^\s*[A-Za-z0-9_./-]+\:\d+\:\d+\:?/.test(line)
+  );
+}
+
+function extractProjectPathsFromText(text: string): string[] {
+  const matches = text.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|css|scss|md)/g) ?? [];
+  return [...new Set(matches
+    .map((value) => value.replace(/^[./]+/, "").trim())
+    .filter((value) => value.length > 0 && !value.startsWith("/"))
+  )].slice(0, 5);
+}
+
+function extractSearchQueriesFromLog(logExcerpt: string): string[] {
+  const queries: string[] = [];
+  const pathMatches = extractProjectPathsFromText(logExcerpt);
+  for (const path of pathMatches) {
+    queries.push(path.split("/").at(-1) ?? path);
+  }
+
+  const codeMatches = logExcerpt.match(/\b[A-Z]{2,}\d{2,}\b/g) ?? [];
+  for (const code of codeMatches) {
+    queries.push(code);
+  }
+
+  const quotedMatches = [
+    ...(logExcerpt.match(/"([^"]{3,80})"/g) ?? []),
+    ...(logExcerpt.match(/'([^']{3,80})'/g) ?? []),
+  ];
+  for (const match of quotedMatches) {
+    queries.push(match.slice(1, -1));
+  }
+
+  const identifierMatches = logExcerpt.match(/\b[A-Za-z_][A-Za-z0-9_]{3,40}\b/g) ?? [];
+  for (const identifier of identifierMatches) {
+    if (/^(error|failed|cannot|module|trace|stack|build|command)$/i.test(identifier)) {
+      continue;
+    }
+    queries.push(identifier);
+  }
+
+  return [...new Set(queries.map((value) => value.trim()).filter((value) => value.length >= 3))].slice(0, 3);
 }
 
 async function runTmuxRelayMode(projectPath: string): Promise<void> {
@@ -194,9 +332,15 @@ async function main() {
     return;
   }
 
+  const chatOnlyMode = args.includes("--chat-only") || args.includes("--standalone");
   const forceOnboarding = args.includes("--onboarding") || args.includes("onboarding");
   const positionalArgs = args.filter(
-    (arg) => arg !== "--onboarding" && arg !== "onboarding" && !arg.startsWith("-"),
+    (arg) =>
+      arg !== "--onboarding" &&
+      arg !== "onboarding" &&
+      arg !== "--chat-only" &&
+      arg !== "--standalone" &&
+      !arg.startsWith("-"),
   );
   const projectPath = positionalArgs[0] ?? process.cwd();
   const debugMode = process.env.CHAVES_DEBUG === "true";
@@ -218,10 +362,12 @@ async function main() {
   }
 
   const devCommand = store.getConfig("dev_command")?.trim() ?? "";
-  const tmuxBootstrap = maybeBootstrapTmuxSession({
-    projectPath,
-    devCommand,
-  });
+  const tmuxBootstrap = chatOnlyMode
+    ? { bootstrapped: false, managed: false, tmuxMissing: false }
+    : maybeBootstrapTmuxSession({
+        projectPath,
+        devCommand,
+      });
   if (tmuxBootstrap.bootstrapped) {
     return;
   }
@@ -351,6 +497,18 @@ async function main() {
     rssBytes: process.memoryUsage().rss,
     heapUsedBytes: process.memoryUsage().heapUsed,
   };
+  let lastTerminalEventId = store.getRecentTerminalEvents(1).at(0)?.id ?? 0;
+  let terminalLineBuffer: string[] = [];
+  let sawFatalTerminalOutputSinceLastExit = false;
+  let isDiagnosingDebugIncident = false;
+  let queuedDebugIncident: PendingDebugIncident | null = null;
+  let lastDebugIncidentFingerprint: string | null = null;
+  let lastDebugIncidentAt = 0;
+  let lastDebugIncidentDiffSnapshotId: number | null = null;
+  let lastDebugSignalAt = 0;
+  let pendingFatalBurst = false;
+  let fatalBurstStartIndex = 0;
+  let fatalBurstTimer: NodeJS.Timeout | null = null;
 
   function refreshSummarizerConfig() {
     summarizer.setModel(store.getModel());
@@ -418,9 +576,287 @@ async function main() {
     updateRuntimeInfo();
   }, 1000);
 
+  function rememberTerminalLine(line: string) {
+    terminalLineBuffer.push(line);
+    if (terminalLineBuffer.length > TERMINAL_BUFFER_LIMIT) {
+      terminalLineBuffer = terminalLineBuffer.slice(-TERMINAL_BUFFER_LIMIT);
+    }
+  }
+
+  function buildCodeMatchesForDebug(logExcerpt: string, candidateFiles: string[]) {
+    const matches: Array<{ path: string; language: string; snippet: string }> = [];
+    const seenPaths = new Set<string>();
+
+    for (const path of candidateFiles) {
+      const file = store.getFile(path);
+      if (!file || file.blocked) continue;
+      matches.push({
+        path: file.path,
+        language: file.language,
+        snippet: file.content.slice(0, 500),
+      });
+      seenPaths.add(file.path);
+      if (matches.length >= 3) {
+        return matches;
+      }
+    }
+
+    for (const query of extractSearchQueriesFromLog(logExcerpt)) {
+      for (const result of store.searchFiles({ query, limit: 3 })) {
+        if (seenPaths.has(result.path)) continue;
+        matches.push({
+          path: result.path,
+          language: result.language,
+          snippet: result.snippet,
+        });
+        seenPaths.add(result.path);
+        if (matches.length >= 3) {
+          return matches;
+        }
+      }
+    }
+
+    return matches;
+  }
+
+  async function processDebugIncident(pending: PendingDebugIncident): Promise<void> {
+    isDiagnosingDebugIncident = true;
+
+    try {
+      const codeMatches = buildCodeMatchesForDebug(
+        pending.logExcerpt,
+        pending.candidateFiles,
+      );
+      const diagnosis = await summarizer.generateDebugDiagnosis({
+        trigger: pending.trigger,
+        exitCode: pending.exitCode,
+        signal: pending.signal,
+        logExcerpt: pending.logExcerpt,
+        recentEvents: pending.recentEvents,
+        diffSummary: pending.diffSummary,
+        codeMatches,
+        previousSummary: lastSummary?.content,
+        previousChatSummary: lastChatSummary?.content,
+        workingMemory: store.getWorkingMemory(),
+        userIntent: buildUserIntentContext(store),
+      });
+
+      const relatedFiles = normalizeRelatedFiles([
+        ...diagnosis.relatedFiles,
+        ...pending.candidateFiles,
+      ]);
+
+      store.updateDebugIncidentDiagnosis({
+        id: pending.incidentId,
+        headline: diagnosis.headline,
+        summary: diagnosis.summary,
+        relatedFiles,
+      });
+
+      const message = buildDebugIncidentMessage({
+        headline: diagnosis.headline,
+        summary: diagnosis.summary,
+        relatedFiles,
+      });
+      await ui.showAssistantMessage(message, "debug");
+      store.addMessage({
+        role: "assistant",
+        channel: "debug",
+        content: message,
+        sessionId,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? `Debug incident detected, but diagnosis failed: ${error.message}`
+          : "Debug incident detected, but diagnosis failed.";
+      logger.error("APP", "Debug diagnosis failed", error);
+      store.updateDebugIncidentDiagnosis({
+        id: pending.incidentId,
+        headline: "Managed dev run failed",
+        summary: message,
+        relatedFiles: pending.candidateFiles,
+      });
+      ui.showError("Debug diagnosis failed", error as Error);
+    } finally {
+      isDiagnosingDebugIncident = false;
+      if (queuedDebugIncident) {
+        const nextIncident = queuedDebugIncident;
+        queuedDebugIncident = null;
+        void processDebugIncident(nextIncident);
+      }
+    }
+  }
+
+  function enqueueDebugIncident(input: {
+    trigger: string;
+    exitCode: number | null;
+    signal: string | null;
+    logExcerpt: string;
+  }) {
+    const candidateFiles = extractProjectPathsFromText(input.logExcerpt);
+    const fingerprintSeed = [
+      input.trigger,
+      ...input.logExcerpt
+        .split("\n")
+        .slice(-TERMINAL_FINGERPRINT_LINES)
+        .map(normalizeTerminalFingerprintLine),
+      candidateFiles[0] ?? "",
+    ].join("\n");
+    const fingerprint = hashString(fingerprintSeed);
+    const latestDiff = store.getRecentDiffSnapshots(1).at(0);
+    const diffSnapshotId = latestDiff?.id ?? null;
+    const now = Date.now();
+
+    if (
+      lastDebugIncidentFingerprint === fingerprint &&
+      lastDebugIncidentDiffSnapshotId === diffSnapshotId &&
+      now - lastDebugIncidentAt < DEBUG_INCIDENT_DEDUPE_WINDOW_MS
+    ) {
+      logger.debug("APP", "Skipping duplicate debug incident", { fingerprint });
+      return;
+    }
+
+    lastDebugIncidentFingerprint = fingerprint;
+    lastDebugIncidentAt = now;
+    lastDebugIncidentDiffSnapshotId = diffSnapshotId;
+    lastDebugSignalAt = now;
+
+    const recentEvents = store
+      .getRecentEvents(10)
+      .filter(isCountableEvent)
+      .reverse();
+    const eventRangeEnd = recentEvents.at(-1)?.id ?? null;
+    const incident = store.createDebugIncident({
+      fingerprint,
+      trigger: input.trigger,
+      exitCode: input.exitCode,
+      signal: input.signal,
+      headline: "Managed dev run failed",
+      summary: "",
+      logExcerpt: input.logExcerpt,
+      relatedFiles: candidateFiles,
+      eventRangeEnd,
+      diffSnapshotId,
+    });
+
+    const pending: PendingDebugIncident = {
+      incidentId: incident.id,
+      fingerprint,
+      trigger: input.trigger,
+      exitCode: input.exitCode,
+      signal: input.signal,
+      logExcerpt: input.logExcerpt,
+      candidateFiles,
+      recentEvents,
+      eventRangeEnd,
+      diffSnapshotId,
+      diffSummary: latestDiff?.prompt,
+    };
+
+    if (isDiagnosingDebugIncident) {
+      queuedDebugIncident = pending;
+      return;
+    }
+
+    void processDebugIncident(pending);
+  }
+
+  function clearFatalBurstTimer() {
+    if (fatalBurstTimer) {
+      clearTimeout(fatalBurstTimer);
+      fatalBurstTimer = null;
+    }
+  }
+
+  function flushFatalBurst(trigger: string) {
+    if (!pendingFatalBurst) return;
+
+    const excerpt = terminalLineBuffer
+      .slice(Math.max(0, fatalBurstStartIndex))
+      .slice(-TERMINAL_INCIDENT_EXCERPT_LINES)
+      .join("\n");
+
+    pendingFatalBurst = false;
+    clearFatalBurstTimer();
+    sawFatalTerminalOutputSinceLastExit = false;
+
+    if (!excerpt.trim()) return;
+
+    enqueueDebugIncident({
+      trigger,
+      exitCode: null,
+      signal: null,
+      logExcerpt: excerpt,
+    });
+  }
+
+  function scheduleFatalBurstDiagnosis() {
+    clearFatalBurstTimer();
+    fatalBurstTimer = setTimeout(() => {
+      flushFatalBurst("managed dev pane emitted a fatal error burst");
+    }, DEBUG_ERROR_BURST_DEBOUNCE_MS);
+  }
+
+  function handleManagedTerminalEvent(event: TerminalEventRecord) {
+    ui.logTerminalEvent(event);
+    rememberTerminalLine(event.data);
+
+    if (isFatalTerminalLine(event.data)) {
+      if (!pendingFatalBurst) {
+        pendingFatalBurst = true;
+        fatalBurstStartIndex = Math.max(0, terminalLineBuffer.length - 1);
+      }
+      sawFatalTerminalOutputSinceLastExit = true;
+      scheduleFatalBurstDiagnosis();
+    } else if (pendingFatalBurst && isBuildFailureLine(event.data)) {
+      scheduleFatalBurstDiagnosis();
+    }
+
+    const trigger = parseManagedFailureTrigger(event.data);
+    if (!trigger) return;
+
+    clearFatalBurstTimer();
+    const excerpt = terminalLineBuffer
+      .slice(-TERMINAL_INCIDENT_EXCERPT_LINES)
+      .join("\n");
+    const triggerText =
+      sawFatalTerminalOutputSinceLastExit
+        ? `${trigger.trigger} after fatal terminal output`
+        : trigger.trigger;
+
+    sawFatalTerminalOutputSinceLastExit = false;
+    if (!excerpt.trim()) return;
+
+    enqueueDebugIncident({
+      trigger: triggerText,
+      exitCode: trigger.exitCode,
+      signal: trigger.signal,
+      logExcerpt: excerpt,
+    });
+  }
+
+  const terminalPollInterval = setInterval(() => {
+    if (!tmuxBootstrap.managed) {
+      return;
+    }
+
+    const terminalEvents = store.getTerminalEventsSince(
+      lastTerminalEventId,
+      TERMINAL_POLL_BATCH_SIZE,
+    );
+
+    for (const event of terminalEvents) {
+      lastTerminalEventId = event.id;
+      handleManagedTerminalEvent(event);
+    }
+  }, 750);
+
   if (tmuxBootstrap.managed) {
     ui.showSuccess(`Dev terminal attached on the right (Ctrl+L to switch pane)`);
     ui.showInfo("Launching managed tmux session (chat + dev shell)");
+  } else if (chatOnlyMode) {
+    ui.showInfo("Chat-only mode enabled; skipping managed tmux dev terminal.");
   } else if (tmuxBootstrap.tmuxMissing) {
     ui.showError(
       "tmux is required for the split dev terminal; continuing in chat-only mode.",
@@ -546,6 +982,15 @@ async function main() {
     recentEvents: ActivityEvent[];
     eventRangeEnd: number;
   }) {
+    if (Date.now() - lastDebugSignalAt < PROACTIVE_DEBUG_COOLDOWN_MS) {
+      logger.debug("APP", "Skipping proactive insight due to recent debug incident");
+      lastSummarizedEventId = Math.max(lastSummarizedEventId, input.eventRangeEnd);
+      eventsSinceLastSummary = store
+        .getEventsSince(lastSummarizedEventId)
+        .filter(isCountableEvent).length;
+      return;
+    }
+
     if (isSummarizing) return;
 
     isSummarizing = true;
@@ -902,6 +1347,8 @@ async function main() {
     if (cleanedUp) return;
     cleanedUp = true;
     clearInterval(runtimeStatsInterval);
+    clearInterval(terminalPollInterval);
+    clearFatalBurstTimer();
     watcher.stop();
     ui.destroy();
     if (isInsideManagedTmuxSession()) {

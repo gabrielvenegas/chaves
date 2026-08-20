@@ -58,6 +58,40 @@ interface GenerateProactiveInsightInput {
   previousInsight?: SessionGoalContext | null;
 }
 
+interface GenerateDebugDiagnosisInput {
+  trigger: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  logExcerpt: string;
+  recentEvents?: ActivityEvent[];
+  diffSummary?: string;
+  codeMatches?: Array<{
+    path: string;
+    language: string;
+    snippet: string;
+  }>;
+  previousSummary?: string;
+  previousChatSummary?: string;
+  workingMemory?: Record<string, string>;
+  userIntent?: string;
+}
+
+export interface DebugDiagnosis {
+  headline: string;
+  summary: string;
+  relatedFiles: string[];
+}
+
+function normalizeDiagnosisFiles(paths: string[] | undefined): string[] {
+  return Array.isArray(paths)
+    ? paths
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .slice(0, 3)
+    : [];
+}
+
 export interface SummarizerOptions {
   model?: string;
   language?: string;
@@ -579,6 +613,104 @@ export class Summarizer {
     }
   }
 
+  async generateDebugDiagnosis(
+    input: GenerateDebugDiagnosisInput,
+  ): Promise<DebugDiagnosis> {
+    this.assertConfigured();
+
+    const sections: string[] = [
+      "Analyze this failed managed dev run and return a single JSON object only.",
+      "Your task is to diagnose the failure conservatively from the provided logs and recent coding context.",
+      'Return JSON with keys: headline, summary, relatedFiles.',
+      "headline: one short sentence naming the failure.",
+      "summary: 2-4 short paragraphs or bullets covering likely root cause, evidence from logs, and the next concrete fix to try.",
+      "relatedFiles: up to 3 project-relative file paths that are most relevant to the fix.",
+      "Do not claim certainty when the logs are ambiguous.",
+      "Do not suggest generic advice like checking the logs or restarting unless it is truly the best next action.",
+      "Do not propose automatic edits or command execution.",
+      "CRITICAL: Return JSON only. No markdown fences. No prose outside the JSON object.",
+    ];
+
+    sections.push(`Failure trigger: ${shield.sanitize(input.trigger)}`);
+    if (input.exitCode !== undefined && input.exitCode !== null) {
+      sections.push(`Exit code: ${input.exitCode}`);
+    }
+    if (input.signal) {
+      sections.push(`Signal: ${shield.sanitize(input.signal)}`);
+    }
+
+    if (input.previousSummary) {
+      sections.push(`Previous coding summary:\n${shield.sanitize(input.previousSummary)}`);
+    }
+
+    if (input.previousChatSummary) {
+      sections.push(`Rolling chat memory:\n${shield.sanitize(input.previousChatSummary)}`);
+    }
+
+    if (input.workingMemory && Object.keys(input.workingMemory).length > 0) {
+      const memoryLines = Object.entries(input.workingMemory)
+        .map(([key, value]) => `- ${key}: ${value}`)
+        .join("\n");
+      sections.push(`Durable Project Memory & Preferences:\n${memoryLines}`);
+    }
+
+    if (input.userIntent) {
+      sections.push(`Recent explicit user guidance:\n${shield.sanitize(input.userIntent)}`);
+    }
+
+    if (input.diffSummary?.trim()) {
+      sections.push(`Latest diff snapshot:\n${shield.sanitize(input.diffSummary)}`);
+    }
+
+    if ((input.recentEvents?.length ?? 0) > 0) {
+      sections.push(
+        [
+          "Recent filesystem events:",
+          ...(input.recentEvents ?? []).map(
+            (event) =>
+              `- [${event.timestamp}] ${event.event_type} ${event.file_path || ""}`.trim(),
+          ),
+        ].join("\n"),
+      );
+    }
+
+    if ((input.codeMatches?.length ?? 0) > 0) {
+      sections.push(
+        [
+          "Relevant indexed code matches:",
+          ...(input.codeMatches ?? []).map(
+            (match, index) =>
+              `${index + 1}. ${match.path} (${match.language})\n${shield.sanitize(match.snippet)}`,
+          ),
+        ].join("\n"),
+      );
+    }
+
+    sections.push(`Failure log excerpt:\n${shield.sanitize(input.logExcerpt)}`);
+
+    const prompt = shield.sanitize(sections.join("\n\n"));
+    logger.aiRequest(prompt.length);
+
+    const { text } = await generateText({
+      model: this.buildChatModel(),
+      system: this.buildSummarySystemPrompt(),
+      prompt,
+      maxTokens: 900,
+    });
+
+    if (text.trim().length === 0) {
+      throw new Error("Empty debug diagnosis returned from AI provider");
+    }
+
+    logger.aiResponse(text.length);
+    try {
+      return this.parseDebugDiagnosis(text);
+    } catch (error) {
+      logger.debug("AI", "Debug diagnosis JSON parse failed, using heuristic fallback", error);
+      return this.buildFallbackDebugDiagnosis(input);
+    }
+  }
+
   private async generateChatCompletion(input: {
     system: string;
     messages: Array<{ role: ChatRole; content: string }>;
@@ -753,6 +885,70 @@ export class Summarizer {
           .slice(0, 5)
         : [],
       shouldNotify: Boolean(parsed.shouldNotify),
+    };
+  }
+
+  private parseDebugDiagnosis(raw: string): DebugDiagnosis {
+    const trimmed = raw.trim();
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) {
+      throw new Error("Debug diagnosis response was not valid JSON");
+    }
+
+    const parsed = JSON.parse(trimmed.slice(start, end + 1)) as Partial<DebugDiagnosis>;
+
+    return {
+      headline: (parsed.headline ?? "").trim() || "Managed dev run failed",
+      summary:
+        (parsed.summary ?? "").trim() ||
+        "The managed dev command failed, but the diagnosis response was empty.",
+      relatedFiles: normalizeDiagnosisFiles(parsed.relatedFiles),
+    };
+  }
+
+  private buildFallbackDebugDiagnosis(input: GenerateDebugDiagnosisInput): DebugDiagnosis {
+    const log = input.logExcerpt;
+    const locationMatch = log.match(/([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json)):(\d+):(\d+)/);
+    const expectedMatch = log.match(/Expected\s+(.+?)\s+but found\s+(.+)/i);
+    const relatedFiles = normalizeDiagnosisFiles([
+      ...(locationMatch ? [locationMatch[1] ?? ""] : []),
+      ...(input.codeMatches?.map((match) => match.path) ?? []),
+    ]);
+
+    if (locationMatch && expectedMatch) {
+      const file = locationMatch[1];
+      const line = locationMatch[2];
+      return {
+        headline: `Syntax error in ${file}`,
+        summary: [
+          `The dev server hit a parser error in ${file}:${line}.`,
+          `The log says it expected ${expectedMatch[1]} but found ${expectedMatch[2]}, which usually means the object or statement just above that token is malformed.`,
+          `The next fix is to inspect the surrounding lines in ${file} and correct the syntax before retrying the build.`,
+        ].join("\n\n"),
+        relatedFiles,
+      };
+    }
+
+    if (/module not found|cannot find module/i.test(log)) {
+      return {
+        headline: "Missing module or import resolution failure",
+        summary: [
+          "The managed dev run failed because a module import could not be resolved.",
+          "The next fix is to inspect the reported import path, verify the target file exists, and align the import path or package dependency with the current project structure.",
+        ].join("\n\n"),
+        relatedFiles,
+      };
+    }
+
+    return {
+      headline: "Managed dev run failed",
+      summary: [
+        `The managed dev pane reported a fatal build/runtime failure via ${input.trigger}.`,
+        "CHAVES could not parse a structured diagnosis from the model response, but the failure log was captured and stored.",
+        "The next fix is to inspect the last reported error location or stack frame in the captured log and correct that source first.",
+      ].join("\n\n"),
+      relatedFiles,
     };
   }
 
