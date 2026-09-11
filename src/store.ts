@@ -3,6 +3,7 @@ import { mkdirSync } from "fs";
 import { join } from "path";
 import Database from "better-sqlite3";
 import { logger } from "./logger.js";
+import type { AiProviderId } from "./providers/types.js";
 import { shield } from "./shield.js";
 
 export type EventType =
@@ -894,6 +895,25 @@ export class Store {
     }));
   }
 
+  listUndiagnosedDebugIncidents(): DebugIncident[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT * FROM debug_incidents
+        WHERE status = 'open' AND trim(summary) = ''
+        ORDER BY id ASC
+      `,
+      )
+      .all() as DebugIncident[];
+    return rows.map((row) => ({
+      ...row,
+      headline: shield.sanitize(row.headline),
+      summary: shield.sanitize(row.summary),
+      log_excerpt: shield.sanitize(row.log_excerpt),
+      related_files_json: row.related_files_json,
+    }));
+  }
+
   getDebugIncidentById(id: number): DebugIncident | null {
     const row = this.db
       .prepare(`SELECT * FROM debug_incidents WHERE id = ? LIMIT 1`)
@@ -934,6 +954,35 @@ export class Store {
       .run("summary_model", modelId);
 
     logger.debug("STORE", "Model configuration saved");
+  }
+
+  getAiProvider(): AiProviderId {
+    const value = this.getConfig("ai_provider");
+    return value === "codex" ? "codex" : "openrouter";
+  }
+
+  setAiProvider(provider: AiProviderId): void {
+    this.setConfig("ai_provider", provider);
+  }
+
+  setAiProviderConfiguration(input: {
+    providerId: AiProviderId;
+    modelId: string;
+    openRouterApiKey?: string;
+  }): void {
+    const transaction = this.db.transaction(() => {
+      this.setAiProvider(input.providerId);
+      this.setModel(input.modelId);
+      if (input.openRouterApiKey != null) {
+        this.setConfig("openrouter_api_key", input.openRouterApiKey);
+      }
+    });
+
+    transaction();
+  }
+
+  close(): void {
+    this.db.close();
   }
 
   getLanguage(): string {

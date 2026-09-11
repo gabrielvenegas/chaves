@@ -1,17 +1,30 @@
 import { createHash, randomUUID } from "crypto";
+import { readFileSync } from "fs";
 import * as os from "os";
+import { dirname, resolve } from "path";
 import { createInterface } from "readline";
 import { stripVTControlCharacters } from "util";
+import { fileURLToPath } from "url";
 import {
   buildFallbackContext,
   buildUserIntentContext,
   handleSlashCommand,
 } from "./chatCommands.js";
 import { createChavesTools } from "./chaves-tools.js";
+import { PendingDebugIncidentQueue } from "./debug-incident-queue.js";
 import { DEFAULT_MAX_FILE_SIZE_BYTES } from "./file-rules.js";
 import { Indexer } from "./indexer.js";
 import { logger } from "./logger.js";
 import { runOnboardingIfNeeded } from "./onboarding.js";
+import {
+  createAiProvider,
+  createCodexAuthManager,
+} from "./providers/factory.js";
+import {
+  AiAvailabilityGate,
+  CODEX_REAUTHENTICATION_MESSAGE,
+  getInteractiveAiErrorOutcome,
+} from "./providers/auth-state.js";
 import { runSetup } from "./setup.js";
 import {
   Summarizer,
@@ -23,6 +36,7 @@ import {
 import {
   Store,
   type ActivityEvent,
+  type DebugIncident,
   type MessageRole,
   type StoredMessage,
   type TerminalEventRecord,
@@ -36,6 +50,11 @@ import { UI } from "./ui.js";
 import { Watcher } from "./watcher.js";
 
 const INDEX_ON_START = parseEnvBool("CHAVES_INDEX_ON_START", true);
+const PACKAGE_JSON_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../package.json",
+);
+const packageVersion = readPackageVersion();
 const INDEX_MAX_FILE_SIZE = parseEnvInt(
   "CHAVES_INDEX_MAX_FILE_SIZE",
   DEFAULT_MAX_FILE_SIZE_BYTES,
@@ -69,6 +88,19 @@ function parseEnvBool(name: string, fallback: boolean): boolean {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+function readPackageVersion(): string {
+  try {
+    const packageJson = JSON.parse(
+      readFileSync(PACKAGE_JSON_PATH, "utf8"),
+    ) as { version?: unknown };
+    return typeof packageJson.version === "string"
+      ? packageJson.version
+      : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function isCountableEventType(type: ActivityEvent["event_type"]): boolean {
@@ -345,6 +377,7 @@ async function main() {
   const projectPath = positionalArgs[0] ?? process.cwd();
   const debugMode = process.env.CHAVES_DEBUG === "true";
   const sessionId = randomUUID();
+  const codexAuthManager = createCodexAuthManager();
 
   logger.setDebugMode(debugMode);
   logger.info("CONFIG", debugMode ? "Debug mode enabled" : "Debug mode disabled");
@@ -356,6 +389,10 @@ async function main() {
     projectPath,
     store,
     force: forceOnboarding,
+  }, {
+    codexAuthManager,
+    sessionId,
+    userAgent: `chaves/${packageVersion}`,
   });
   if (onboardingResult === "aborted") {
     process.exit(0);
@@ -387,8 +424,6 @@ async function main() {
     "collaborative",
   ) as Personality;
 
-  const apiKey = store.getConfig("openrouter_api_key")?.trim() ?? "";
-
   const baseSummaryThreshold =
     frequencyLevel === 1 ? 20 : frequencyLevel === 3 ? 5 : 10;
   const baseMinUniqueFiles =
@@ -409,10 +444,23 @@ async function main() {
     baseMinCountableEvents,
   );
 
+  const providerId = store.getAiProvider();
+  const provider = providerId === "openrouter"
+    ? createAiProvider({
+        providerId,
+        apiKey: store.getConfig("openrouter_api_key")?.trim() ?? "",
+      })
+    : createAiProvider({
+        providerId,
+        auth: codexAuthManager,
+        sessionId,
+        userAgent: `chaves/${packageVersion}`,
+      });
+
   const summarizer = new Summarizer({
+    provider,
     model: store.getModel(),
     language: store.getLanguage(),
-    apiKey,
     frequencyLevel,
     personality,
     thinkingEffort: store.getThinkingEffort(),
@@ -422,6 +470,21 @@ async function main() {
     showPaneToggleHint: tmuxBootstrap.managed,
     theme: store.getTheme(),
   });
+  const aiAvailabilityGate = new AiAvailabilityGate();
+
+  function handleAiError(context: string, error: unknown) {
+    const disposition = aiAvailabilityGate.handleError(error);
+    if (disposition.authRequired) {
+      if (disposition.shouldNotify) {
+        logger.error("APP", context, error);
+        ui.showError(CODEX_REAUTHENTICATION_MESSAGE);
+      }
+      return disposition;
+    }
+
+    logger.error("APP", context, error);
+    return disposition;
+  }
   ui.onThemeChange((newTheme) => {
     store.setTheme(newTheme);
   });
@@ -492,7 +555,8 @@ async function main() {
   let terminalLineBuffer: string[] = [];
   let sawFatalTerminalOutputSinceLastExit = false;
   let isDiagnosingDebugIncident = false;
-  let queuedDebugIncident: PendingDebugIncident | null = null;
+  const debugIncidentQueue =
+    new PendingDebugIncidentQueue<PendingDebugIncident>();
   let lastDebugIncidentFingerprint: string | null = null;
   let lastDebugIncidentAt = 0;
   let lastDebugIncidentDiffSnapshotId: number | null = null;
@@ -610,8 +674,17 @@ async function main() {
     return matches;
   }
 
-  async function processDebugIncident(pending: PendingDebugIncident): Promise<void> {
+  async function processNextDebugIncident(): Promise<void> {
+    if (
+      isDiagnosingDebugIncident ||
+      !aiAvailabilityGate.canRunBackground()
+    ) return;
+
+    const pending = debugIncidentQueue.peek();
+    if (!pending) return;
+
     isDiagnosingDebugIncident = true;
+    let completed = false;
 
     try {
       const codeMatches = buildCodeMatchesForDebug(
@@ -656,12 +729,17 @@ async function main() {
         content: message,
         sessionId,
       });
+      completed = true;
     } catch (error) {
+      const disposition = handleAiError("Debug diagnosis failed", error);
+      if (disposition.authRequired) {
+        return;
+      }
+
       const message =
         error instanceof Error
           ? `Debug incident detected, but diagnosis failed: ${error.message}`
           : "Debug incident detected, but diagnosis failed.";
-      logger.error("APP", "Debug diagnosis failed", error);
       store.updateDebugIncidentDiagnosis({
         id: pending.incidentId,
         headline: "Managed dev run failed",
@@ -669,14 +747,59 @@ async function main() {
         relatedFiles: pending.candidateFiles,
       });
       ui.showError("Debug diagnosis failed", error as Error);
+      completed = true;
     } finally {
       isDiagnosingDebugIncident = false;
-      if (queuedDebugIncident) {
-        const nextIncident = queuedDebugIncident;
-        queuedDebugIncident = null;
-        void processDebugIncident(nextIncident);
+      if (completed) {
+        debugIncidentQueue.complete(pending.incidentId);
+      }
+      if (completed && aiAvailabilityGate.canRunBackground()) {
+        void processNextDebugIncident();
       }
     }
+  }
+
+  function restorePendingDebugIncident(
+    incident: DebugIncident,
+  ): PendingDebugIncident {
+    let candidateFiles: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(incident.related_files_json);
+      if (Array.isArray(parsed)) {
+        candidateFiles = normalizeRelatedFiles(
+          parsed.filter((value): value is string => typeof value === "string"),
+        );
+      }
+    } catch {
+      candidateFiles = extractProjectPathsFromText(incident.log_excerpt);
+    }
+
+    const recentEvents = store
+      .getRecentEvents(10)
+      .filter(isCountableEvent)
+      .filter(
+        (event) =>
+          incident.event_range_end === null ||
+          (event.id ?? 0) <= incident.event_range_end,
+      )
+      .reverse();
+    const diffSnapshot = incident.diff_snapshot_id === null
+      ? null
+      : store.getDiffSnapshotById(incident.diff_snapshot_id);
+
+    return {
+      incidentId: incident.id,
+      fingerprint: incident.fingerprint,
+      trigger: incident.trigger,
+      exitCode: incident.exit_code,
+      signal: incident.signal,
+      logExcerpt: incident.log_excerpt,
+      candidateFiles,
+      recentEvents,
+      eventRangeEnd: incident.event_range_end,
+      diffSnapshotId: incident.diff_snapshot_id,
+      diffSummary: diffSnapshot?.prompt,
+    };
   }
 
   function enqueueDebugIncident(input: {
@@ -745,13 +868,14 @@ async function main() {
       diffSummary: latestDiff?.prompt,
     };
 
-    if (isDiagnosingDebugIncident) {
-      queuedDebugIncident = pending;
-      return;
-    }
-
-    void processDebugIncident(pending);
+    debugIncidentQueue.enqueue(pending);
+    void processNextDebugIncident();
   }
+
+  for (const incident of store.listUndiagnosedDebugIncidents()) {
+    debugIncidentQueue.enqueue(restorePendingDebugIncident(incident));
+  }
+  void processNextDebugIncident();
 
   function clearFatalBurstTimer() {
     if (fatalBurstTimer) {
@@ -863,7 +987,7 @@ async function main() {
   }
 
   async function maybeSummarizeChatHistory() {
-    if (isSummarizingChat) return;
+    if (!aiAvailabilityGate.canRunBackground() || isSummarizingChat) return;
 
     const pendingChatMessages = store.getMessagesSince(
       lastChatSummaryEndMessageId,
@@ -897,13 +1021,15 @@ async function main() {
         `Saved rolling chat summary up to message #${lastMessageId}`,
       );
     } catch (error) {
-      logger.error("APP", "Chat summary generation failed", error);
+      handleAiError("Chat summary generation failed", error);
     } finally {
       isSummarizingChat = false;
     }
   }
 
   async function maybeExtractMemory() {
+    if (!aiAvailabilityGate.canRunBackground()) return;
+
     const pendingChatMessages = store.getMessagesSince(
       lastChatSummaryEndMessageId,
       "chat",
@@ -923,7 +1049,7 @@ async function main() {
         logger.debug("APP", `Updated durable memory with ${Object.keys(updates).length} changes`);
       }
     } catch (error) {
-      logger.error("APP", "Memory extraction failed", error);
+      handleAiError("Memory extraction failed", error);
     }
   }
 
@@ -973,6 +1099,8 @@ async function main() {
     recentEvents: ActivityEvent[];
     eventRangeEnd: number;
   }) {
+    if (!aiAvailabilityGate.canRunBackground()) return;
+
     if (Date.now() - lastDebugSignalAt < PROACTIVE_DEBUG_COOLDOWN_MS) {
       logger.debug("APP", "Skipping proactive insight due to recent debug incident");
       lastSummarizedEventId = Math.max(lastSummarizedEventId, input.eventRangeEnd);
@@ -1016,10 +1144,7 @@ async function main() {
         sessionId,
       });
     } catch (error) {
-      logger.error("APP", "Proactive insight generation failed:", error);
-      if (error instanceof Error) {
-        logger.error("APP", `Error details: ${error.message}`);
-      }
+      handleAiError("Proactive insight generation failed", error);
     } finally {
       isSummarizing = false;
       // Reset events count since we just performed a proactive summary
@@ -1035,6 +1160,7 @@ async function main() {
 
     try {
       const slashOutput = await handleSlashCommand(text, store, {
+        modelProvider: provider,
         runtimeStats: latestRuntimeStats,
       });
       refreshSummarizerConfig();
@@ -1125,13 +1251,15 @@ async function main() {
       await maybeSummarizeChatHistory();
       void maybeExtractMemory();
     } catch (error) {
-      logger.error("APP", "Chat response failed:", error);
-      ui.showError("Chat response failed", error as Error);
+      const disposition = handleAiError("Chat response failed", error);
+      const outcome = getInteractiveAiErrorOutcome(error, disposition);
+      if (outcome.shouldShowGenericError) {
+        ui.showError("Chat response failed", error as Error);
+      }
       store.addMessage({
         role: "assistant",
         channel: "error",
-        content:
-          error instanceof Error ? error.message : "Chat response failed",
+        content: outcome.storedMessage,
         sessionId,
       });
     } finally {
@@ -1142,7 +1270,11 @@ async function main() {
   });
 
   async function runSummaryIfNeeded() {
-    if (isSummarizing || eventsSinceLastSummary < SUMMARY_THRESHOLD) return;
+    if (
+      !aiAvailabilityGate.canRunBackground() ||
+      isSummarizing ||
+      eventsSinceLastSummary < SUMMARY_THRESHOLD
+    ) return;
 
     isSummarizing = true;
     logger.info("APP", "Summary threshold reached, generating fallback summary...");
@@ -1216,10 +1348,7 @@ async function main() {
 
       logger.info("APP", `Summary done (${Date.now() - startTime}ms)`);
     } catch (error) {
-      logger.error("APP", "Summary generation failed:", error);
-      if (error instanceof Error) {
-        logger.error("APP", `Error details: ${error.message}`);
-      }
+      handleAiError("Summary generation failed", error);
     } finally {
       isSummarizing = false;
       eventsSinceLastSummary = store
@@ -1231,7 +1360,10 @@ async function main() {
         `Events since last summary: ${eventsSinceLastSummary}/${SUMMARY_THRESHOLD}`,
       );
 
-      if (eventsSinceLastSummary >= SUMMARY_THRESHOLD) {
+      if (
+        aiAvailabilityGate.canRunBackground() &&
+        eventsSinceLastSummary >= SUMMARY_THRESHOLD
+      ) {
         await runSummaryIfNeeded();
       }
     }
@@ -1321,10 +1453,7 @@ async function main() {
         eventRangeEnd,
       });
     } catch (error) {
-      logger.error("APP", "Diff summary failed:", error);
-      if (error instanceof Error) {
-        logger.error("APP", `Error details: ${error.message}`);
-      }
+      handleAiError("Diff summary failed", error);
     }
   });
 

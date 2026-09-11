@@ -1,20 +1,9 @@
 import { writeFileSync } from "fs";
 import { join } from "path";
 import { POPULAR_MODELS } from "./modelSetup.js";
+import type { AiModelInfo, AiProvider } from "./providers/types.js";
 import { type ActivityEvent, Store } from "./store.js";
 import { THEME_OPTIONS, isThemeName } from "./theme.js";
-
-interface OpenRouterModelSummary {
-  id: string;
-  name?: string;
-  description?: string;
-  context_length?: number;
-  pricing?: {
-    prompt?: string;
-    completion?: string;
-  };
-  supported_parameters?: string[];
-}
 
 export interface ChatCommandDefinition {
   command: string;
@@ -27,7 +16,8 @@ export interface ChatCommandResult {
   effect?: "clear_context";
 }
 
-interface ChatCommandContext {
+export interface ChatCommandContext {
+  modelProvider?: AiProvider;
   runtimeStats?: {
     cpuPercent: number;
     rssBytes: number;
@@ -153,53 +143,86 @@ function resolveModelSelection(rawValue: string): string | null {
   return value;
 }
 
-function getActiveApiKey(store: Store): string {
-  return store.getConfig("openrouter_api_key")?.trim() ?? "";
-}
-
-function getModelCache(store: Store): OpenRouterModelSummary[] {
-  const raw = store.getConfig("openrouter_models_cache");
-  if (!raw) return [];
+function getModelCache(
+  store: Store,
+  provider: AiProvider,
+): AiModelInfo[] | null {
+  const raw = store.getConfig(`model_cache:${provider.id}`);
+  if (!raw) return null;
 
   try {
-    const parsed = JSON.parse(raw) as OpenRouterModelSummary[];
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed = JSON.parse(raw) as AiModelInfo[];
+    return Array.isArray(parsed) ? parsed : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-function setModelCache(store: Store, models: OpenRouterModelSummary[]) {
-  store.setConfig("openrouter_models_cache", JSON.stringify(models));
-  store.setConfig("openrouter_models_cache_at", new Date().toISOString());
+function setModelCache(
+  store: Store,
+  provider: AiProvider,
+  models: AiModelInfo[],
+) {
+  store.setConfig(`model_cache:${provider.id}`, JSON.stringify(models));
+  store.setConfig(`model_cache_at:${provider.id}`, new Date().toISOString());
 }
 
-function getLastModelSearchResults(store: Store): string[] {
-  const raw = store.getConfig("model_search_results");
-  if (!raw) return [];
+function getLastModelSearchResults(
+  store: Store,
+  provider?: AiProvider,
+): string[] | null {
+  const key = provider
+    ? `model_search_results:${provider.id}`
+    : "model_search_results";
+  const raw = store.getConfig(key);
+  if (!raw) return null;
 
   try {
     const parsed = JSON.parse(raw) as string[];
-    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string") : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((value) => typeof value === "string")
+      : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-function setLastModelSearchResults(store: Store, modelIds: string[]) {
-  store.setConfig("model_search_results", JSON.stringify(modelIds));
-  store.setConfig("model_search_results_at", new Date().toISOString());
+function setLastModelSearchResults(
+  store: Store,
+  modelIds: string[],
+  provider?: AiProvider,
+) {
+  const key = provider
+    ? `model_search_results:${provider.id}`
+    : "model_search_results";
+  store.setConfig(key, JSON.stringify(modelIds));
+  store.setConfig(`${key}_at`, new Date().toISOString());
 }
 
-function resolveModelSelectionWithSearch(store: Store, rawValue: string): string | null {
+async function resolveModelSelectionWithSearch(
+  store: Store,
+  rawValue: string,
+  provider?: AiProvider,
+): Promise<string | null> {
   const value = rawValue.trim();
   if (!value) return null;
 
   const numericSelection = Number.parseInt(value, 10);
   if (Number.isFinite(numericSelection)) {
-    const searchResults = getLastModelSearchResults(store);
-    const selectedSearchModel = searchResults[numericSelection - 1];
+    const searchResults = getLastModelSearchResults(store, provider);
+    const selectedSearchModel = searchResults?.[numericSelection - 1];
     if (selectedSearchModel) return selectedSearchModel;
+
+    if (provider) {
+      if (searchResults !== null) return null;
+      const providerModels = await getSearchableModels(store, provider);
+      return providerModels[numericSelection - 1]?.id ?? null;
+    }
+  }
+
+  if (provider?.id === "codex") {
+    const providerModels = await getSearchableModels(store, provider);
+    return providerModels.some((model) => model.id === value) ? value : null;
   }
 
   return resolveModelSelection(value);
@@ -212,10 +235,10 @@ function formatPrice(rawPrice?: string): string {
   return `$${parsed.toFixed(parsed < 0.001 ? 6 : 4)}/1K tok`;
 }
 
-function rankModel(query: string, model: OpenRouterModelSummary): number {
+function rankModel(query: string, model: AiModelInfo): number {
   const q = query.trim().toLowerCase();
   const id = model.id.toLowerCase();
-  const name = (model.name ?? "").toLowerCase();
+  const name = model.name.toLowerCase();
   const description = (model.description ?? "").toLowerCase();
 
   if (id === q) return 1000;
@@ -228,34 +251,24 @@ function rankModel(query: string, model: OpenRouterModelSummary): number {
   return 0;
 }
 
-async function fetchOpenRouterModels(store: Store): Promise<OpenRouterModelSummary[]> {
-  const apiKey = getActiveApiKey(store);
-  if (!apiKey) {
-    throw new Error("OpenRouter API key is not configured.");
-  }
-
-  const response = await fetch("https://openrouter.ai/api/v1/models", {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenRouter models request failed: ${response.status} ${response.statusText}`);
-  }
-
-  const payload = await response.json() as { data?: OpenRouterModelSummary[] };
-  const models = Array.isArray(payload.data) ? payload.data : [];
-  setModelCache(store, models);
-  return models;
+export function rankModels(query: string, models: AiModelInfo[]): AiModelInfo[] {
+  return models
+    .map((model) => ({ model, score: rankModel(query, model) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.model.id.localeCompare(b.model.id))
+    .slice(0, 12)
+    .map((entry) => entry.model);
 }
 
-async function getSearchableModels(store: Store): Promise<OpenRouterModelSummary[]> {
-  const cachedModels = getModelCache(store);
-  const cachedAt = store.getConfig("openrouter_models_cache_at");
+async function getSearchableModels(
+  store: Store,
+  provider: AiProvider,
+): Promise<AiModelInfo[]> {
+  const cachedModels = getModelCache(store, provider);
+  const cachedAt = store.getConfig(`model_cache_at:${provider.id}`);
   const maxAgeMs = 24 * 60 * 60 * 1000;
 
-  if (cachedModels.length > 0 && cachedAt) {
+  if (cachedModels !== null && cachedAt) {
     const ageMs = Date.now() - new Date(cachedAt).getTime();
     if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < maxAgeMs) {
       return cachedModels;
@@ -263,9 +276,11 @@ async function getSearchableModels(store: Store): Promise<OpenRouterModelSummary
   }
 
   try {
-    return await fetchOpenRouterModels(store);
+    const models = await provider.listModels();
+    setModelCache(store, provider, models);
+    return models;
   } catch (error) {
-    if (cachedModels.length > 0) return cachedModels;
+    if (cachedModels !== null) return cachedModels;
     throw error;
   }
 }
@@ -273,18 +288,17 @@ async function getSearchableModels(store: Store): Promise<OpenRouterModelSummary
 async function searchModels(
   store: Store,
   query: string,
-): Promise<OpenRouterModelSummary[]> {
-  const models = await getSearchableModels(store);
-  const ranked = models
-    .map((model) => ({ model, score: rankModel(query, model) }))
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || a.model.id.localeCompare(b.model.id))
-    .slice(0, 12)
-    .map((entry) => entry.model);
+  provider?: AiProvider,
+): Promise<AiModelInfo[]> {
+  const models = provider
+    ? await getSearchableModels(store, provider)
+    : POPULAR_MODELS;
+  const ranked = rankModels(query, models);
 
   setLastModelSearchResults(
     store,
     ranked.map((model) => model.id),
+    provider,
   );
 
   return ranked;
@@ -293,7 +307,7 @@ async function searchModels(
 function formatModelSearchResults(
   store: Store,
   query: string,
-  models: OpenRouterModelSummary[],
+  models: AiModelInfo[],
 ): string {
   const currentModel = store.getModel();
 
@@ -309,10 +323,10 @@ function formatModelSearchResults(
     `Model search results for "${query}":`,
     ...models.map((model, index) => {
       const active = model.id === currentModel ? " [current]" : "";
-      const context = model.context_length ? `ctx ${model.context_length}` : "ctx -";
-      const promptPrice = `in ${formatPrice(model.pricing?.prompt)}`;
-      const completionPrice = `out ${formatPrice(model.pricing?.completion)}`;
-      const label = model.name && model.name !== model.id
+      const context = model.contextLength ? `ctx ${model.contextLength}` : "ctx -";
+      const promptPrice = `in ${formatPrice(model.inputPrice)}`;
+      const completionPrice = `out ${formatPrice(model.outputPrice)}`;
+      const label = model.name !== model.id
         ? `${model.name} - ${model.id}`
         : model.id;
       return `${index + 1}. ${label}${active}\n   ${context} | ${promptPrice} | ${completionPrice}`;
@@ -322,15 +336,20 @@ function formatModelSearchResults(
   ].join("\n");
 }
 
-function formatModelList(store: Store): string {
-  const currentModel = store.getModel();
-
+export function formatModelList(
+  currentModel: string,
+  models: AiModelInfo[],
+): string {
   return [
     "Popular models:",
-    ...POPULAR_MODELS.map((model, index) => {
+    ...models.map((model, index) => {
       const active = model.id === currentModel ? " [current]" : "";
       const description = model.description ? ` - ${model.description}` : "";
-      return `${index + 1}. ${model.id}${active}${description}`;
+      const label = model.name !== model.id
+        ? `${model.name} - ${model.id}`
+        : model.id;
+      const context = model.contextLength ? ` | ctx ${model.contextLength}` : "";
+      return `${index + 1}. ${label}${active}${description}${context}`;
     }),
   ].join("\n");
 }
@@ -338,6 +357,7 @@ function formatModelList(store: Store): string {
 function formatSetupSummary(store: Store): string {
   return [
     "Current setup:",
+    `- provider: ${store.getAiProvider()}`,
     `- model: ${store.getModel()}`,
     `- thinking: ${store.getThinkingEffort()}`,
     `- language: ${store.getLanguage()}`,
@@ -351,7 +371,7 @@ function formatSetupSummary(store: Store): string {
     "- /stats",
     "- /theme set <warm|slate|forest>",
     "",
-    "For the full interactive wizard, run `bun run setup` outside the TUI.",
+    "For the full interactive wizard, run `chaves --setup` outside the TUI.",
   ].join("\n");
 }
 
@@ -527,7 +547,7 @@ export async function handleSlashCommand(
           `Current model: ${store.getModel()}`,
           "",
           "Use `/model list` to see popular models.",
-          "Use `/model search <query>` to search OpenRouter models.",
+          `Use \`/model search <query>\` to search ${context.modelProvider?.displayName ?? "OpenRouter"} models.`,
           "Use `/model set <id|number>` to change the model.",
           ].join("\n"),
         };
@@ -535,7 +555,24 @@ export async function handleSlashCommand(
 
       const [subcommand, ...rest] = args;
       if (subcommand?.toLowerCase() === "list") {
-        return { output: formatModelList(store) };
+        try {
+          const models = context.modelProvider
+            ? await getSearchableModels(store, context.modelProvider)
+            : POPULAR_MODELS;
+          setLastModelSearchResults(
+            store,
+            models.map((model) => model.id),
+            context.modelProvider,
+          );
+          return { output: formatModelList(store.getModel(), models) };
+        } catch (error) {
+          return {
+            output:
+              error instanceof Error
+                ? `Model list failed: ${error.message}`
+                : "Model list failed.",
+          };
+        }
       }
       if (subcommand?.toLowerCase() === "search") {
         const query = rest.join(" ").trim();
@@ -544,7 +581,7 @@ export async function handleSlashCommand(
         }
 
         try {
-          const results = await searchModels(store, query);
+          const results = await searchModels(store, query, context.modelProvider);
           return { output: formatModelSearchResults(store, query, results) };
         } catch (error) {
           return {
@@ -558,7 +595,11 @@ export async function handleSlashCommand(
 
       const rawSelection =
         subcommand?.toLowerCase() === "set" ? rest.join(" ") : args.join(" ");
-      const selectedModel = resolveModelSelectionWithSearch(store, rawSelection);
+      const selectedModel = await resolveModelSelectionWithSearch(
+        store,
+        rawSelection,
+        context.modelProvider,
+      );
       if (!selectedModel) {
         return {
           output:

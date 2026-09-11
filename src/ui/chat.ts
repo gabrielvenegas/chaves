@@ -368,6 +368,21 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
     await updateMatchingCommands();
   }
 
+  async function deleteWordBackward() {
+    if (cursorCol === 0) return;
+
+    const line = currentLine();
+    const textBeforeCursor = line.slice(0, cursorCol);
+    const match = textBeforeCursor.match(/\S+\s*$/u)
+      ?? textBeforeCursor.match(/\s+$/u);
+    if (!match) return;
+
+    const deleteFrom = cursorCol - match[0].length;
+    draftLines[cursorRow] = line.slice(0, deleteFrom) + line.slice(cursorCol);
+    cursorCol = deleteFrom;
+    await updateMatchingCommands();
+  }
+
   async function deleteForward() {
     const line = currentLine();
     if (cursorCol < line.length) {
@@ -770,6 +785,12 @@ export function createChatUI(options: ChatUIOptions = {}): ChatUI {
       draftLines[cursorRow] = "";
       cursorCol = 0;
       await updateMatchingCommands();
+      scheduleRender();
+      return;
+    }
+
+    if (key.ctrl && key.name === "w") {
+      await deleteWordBackward();
       scheduleRender();
       return;
     }
