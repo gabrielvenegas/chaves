@@ -90,6 +90,9 @@ function sanitizeJsonBody(
     }
     const sanitized = { ...parsed } as Record<string, unknown>;
     delete sanitized.max_output_tokens;
+    delete sanitized.temperature;
+    delete sanitized.top_p;
+    delete sanitized.top_logprobs;
     return new TextEncoder().encode(JSON.stringify(sanitized)).buffer;
   } catch {
     return body;

@@ -105,6 +105,31 @@ function normalizeDiagnosisFiles(paths: string[] | undefined): string[] {
     : [];
 }
 
+function getProviderResponseBody(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("responseBody" in error)) {
+    return undefined;
+  }
+  return typeof error.responseBody === "string" ? error.responseBody : undefined;
+}
+
+function parseProviderErrorDetail(error: unknown): string | undefined {
+  const responseBody = getProviderResponseBody(error);
+  if (!responseBody) return undefined;
+
+  try {
+    const payload = JSON.parse(responseBody) as Record<string, unknown>;
+    return typeof payload.detail === "string" ? payload.detail : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeStreamError(error: unknown): Error {
+  const detail = parseProviderErrorDetail(error);
+  if (detail) return new Error(detail, { cause: error });
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 export interface SummarizerOptions {
   provider: AiProvider;
   model?: string;
@@ -185,15 +210,20 @@ export class Summarizer {
 
   private async requestText(input: TextRequestInput): Promise<string> {
     const { tools, ...request } = input;
+    let streamError: unknown;
     const result = streamText({
       model: this.buildChatModel(),
       ...request,
       tools: tools as any,
       toolChoice: tools ? "auto" : undefined,
       maxSteps: tools ? 5 : undefined,
+      onError: ({ error }) => {
+        streamError = error;
+      },
     });
     let text = "";
     for await (const delta of result.textStream) text += delta;
+    if (streamError !== undefined) throw normalizeStreamError(streamError);
     return text;
   }
 
@@ -727,6 +757,7 @@ export class Summarizer {
     try {
       await input.onStatus?.("Thinking...");
 
+      let streamError: unknown;
       const result = await streamText({
         model: this.buildChatModel(),
         system: input.system,
@@ -748,6 +779,9 @@ export class Summarizer {
               }
             }
           : undefined,
+        onError: ({ error }) => {
+          streamError = error;
+        },
       });
 
       let fullText = "";
@@ -758,6 +792,9 @@ export class Summarizer {
         }
       }
 
+      if (streamError !== undefined) {
+        throw normalizeStreamError(streamError);
+      }
       if (fullText.trim().length === 0) {
         throw new Error("Empty response returned from AI provider");
       }
