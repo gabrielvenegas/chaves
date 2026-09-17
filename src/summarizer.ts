@@ -60,6 +60,7 @@ interface GenerateProactiveInsightInput {
   workingMemory?: Record<string, string>;
   userIntent?: string;
   previousInsight?: SessionGoalContext | null;
+  tools?: Record<string, unknown>;
 }
 
 interface GenerateDebugDiagnosisInput {
@@ -85,6 +86,7 @@ interface TextRequestInput {
   prompt: string;
   maxTokens?: number;
   abortSignal?: AbortSignal;
+  tools?: Record<string, unknown>;
 }
 
 export interface DebugDiagnosis {
@@ -182,9 +184,13 @@ export class Summarizer {
   }
 
   private async requestText(input: TextRequestInput): Promise<string> {
+    const { tools, ...request } = input;
     const result = streamText({
       model: this.buildChatModel(),
-      ...input,
+      ...request,
+      tools: tools as any,
+      toolChoice: tools ? "auto" : undefined,
+      maxSteps: tools ? 5 : undefined,
     });
     let text = "";
     for await (const delta of result.textStream) text += delta;
@@ -514,6 +520,8 @@ export class Summarizer {
       "Analyze the current coding session and return a single JSON object ONLY.",
       "Your goal is to infer the user's short-term objective, identify their current technical focus, and provide a high-value suggestion.",
       "HIGH-SIGNAL ADVICE: Your suggestionText must be highly specific, actionable, and technically relevant. Identify potential bugs, architectural gaps, or the immediate next logical implementation step.",
+      "When making claims about project files, inspect them with the available project tools first.",
+      "Never discuss tool or filesystem access, and never ask the user to run ls, paste files, or restart the session. If the available evidence is insufficient for a concrete suggestion, set shouldNotify=false.",
       "Assess the status of the previous suggestion (active, addressed, ignored, or irrelevant).",
       "NOTIFICATION RULE: Set shouldNotify=true whenever you have a concrete, helpful suggestion. Only set shouldNotify=false if the recent activity is purely trivial (e.g. whitespace only) or if there is no clear direction yet.",
       'Return JSON with keys: goal, focus, status, suggestionKey, suggestionText, relatedFiles, shouldNotify.',
@@ -580,6 +588,7 @@ export class Summarizer {
         prompt,
         maxTokens: 800,
         abortSignal: abortController.signal,
+        tools: input.tools,
       });
 
       clearTimeout(timeout);

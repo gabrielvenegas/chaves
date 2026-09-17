@@ -1123,6 +1123,7 @@ async function main() {
         workingMemory: store.getWorkingMemory(),
         userIntent: buildUserIntentContext(store),
         previousInsight: sessionGoalState,
+        tools,
       });
 
       const { shouldDisplay, message } = applySessionGoalInsight(insight);
