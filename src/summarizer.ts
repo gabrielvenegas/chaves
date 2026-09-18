@@ -1,6 +1,10 @@
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { generateText, streamText } from "ai";
+import { streamText } from "ai";
 import { logger } from "./logger.js";
+import {
+  ProviderAuthRequiredError,
+  type AiProvider,
+  type ThinkingEffort,
+} from "./providers/types.js";
 import { shield } from "./shield.js";
 import type { ActivityEvent, StoredMessage } from "./store.js";
 
@@ -8,7 +12,7 @@ type ChatRole = "user" | "assistant" | "system";
 
 export type MessageFrequencyLevel = 1 | 2 | 3;
 export type Personality = "technical" | "collaborative" | "creative";
-export type ThinkingEffort = "low" | "medium" | "high";
+export type { ThinkingEffort } from "./providers/types.js";
 export type ProactiveInsightStatus = "active" | "addressed" | "ignored" | "irrelevant";
 
 export interface ChatHistoryMessage {
@@ -56,6 +60,7 @@ interface GenerateProactiveInsightInput {
   workingMemory?: Record<string, string>;
   userIntent?: string;
   previousInsight?: SessionGoalContext | null;
+  tools?: Record<string, unknown>;
 }
 
 interface GenerateDebugDiagnosisInput {
@@ -76,6 +81,14 @@ interface GenerateDebugDiagnosisInput {
   userIntent?: string;
 }
 
+interface TextRequestInput {
+  system?: string;
+  prompt: string;
+  maxTokens?: number;
+  abortSignal?: AbortSignal;
+  tools?: Record<string, unknown>;
+}
+
 export interface DebugDiagnosis {
   headline: string;
   summary: string;
@@ -92,55 +105,73 @@ function normalizeDiagnosisFiles(paths: string[] | undefined): string[] {
     : [];
 }
 
+function getProviderResponseBody(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("responseBody" in error)) {
+    return undefined;
+  }
+  return typeof error.responseBody === "string" ? error.responseBody : undefined;
+}
+
+function parseProviderErrorDetail(error: unknown): string | undefined {
+  const responseBody = getProviderResponseBody(error);
+  if (!responseBody) return undefined;
+
+  try {
+    const payload = JSON.parse(responseBody) as Record<string, unknown>;
+    return typeof payload.detail === "string" ? payload.detail : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeStreamError(error: unknown): Error {
+  const detail = parseProviderErrorDetail(error);
+  if (detail) return new Error(detail, { cause: error });
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 export interface SummarizerOptions {
+  provider: AiProvider;
   model?: string;
   language?: string;
-  apiKey?: string;
   frequencyLevel?: MessageFrequencyLevel;
   personality?: Personality;
   thinkingEffort?: ThinkingEffort;
 }
 
 export class Summarizer {
-  private client: ReturnType<typeof createOpenRouter>;
+  private provider: AiProvider;
   private model: string;
   private language: string;
-  private apiKey?: string;
   private frequencyLevel: MessageFrequencyLevel;
   private personality: Personality;
   private thinkingEffort: ThinkingEffort;
 
-  constructor(options: SummarizerOptions = {}) {
+  constructor(options: SummarizerOptions) {
+    this.provider = options.provider;
     this.model = options.model ?? "anthropic/claude-3.5-haiku";
     this.language = options.language ?? "en";
-    this.apiKey = options.apiKey ?? "";
     this.frequencyLevel = options.frequencyLevel ?? 2;
     this.personality = options.personality ?? "collaborative";
     this.thinkingEffort = options.thinkingEffort ?? "medium";
 
-    logger.debug("AI", "Initializing OpenRouter client");
-    this.client = createOpenRouter({
-      apiKey: this.apiKey,
-    });
-    logger.debug("AI", "OpenRouter client initialized");
+    logger.debug("AI", `Using provider: ${this.provider.displayName}`);
     logger.debug("AI", `Using model: ${this.model}`);
     logger.debug("AI", `Using language: ${this.language}`);
     logger.debug("AI", `Using thinking effort: ${this.thinkingEffort}`);
-
-    if (!this.apiKey) {
-      logger.warn("AI", "OpenRouter API key not set - AI features will fail");
-    }
   }
 
   getModel(): string {
     return this.model;
   }
 
-  private assertConfigured(): void {
-    if (!this.apiKey?.trim()) {
-      throw new Error(
-        "OpenRouter API key is not configured. Run /setup to set your key.",
-      );
+  private async assertConfigured(): Promise<void> {
+    const status = await this.provider.getAuthStatus();
+    if (status.state === "configuration-required") {
+      throw new Error(status.message);
+    }
+    if (status.state === "reauth-required") {
+      throw new ProviderAuthRequiredError(status.message);
     }
   }
 
@@ -174,27 +205,26 @@ export class Summarizer {
   }
 
   private buildChatModel() {
-    return this.client.chat(this.model, {
-      reasoning: {
-        effort: this.thinkingEffort,
+    return this.provider.getModel(this.model, this.thinkingEffort);
+  }
+
+  private async requestText(input: TextRequestInput): Promise<string> {
+    const { tools, ...request } = input;
+    let streamError: unknown;
+    const result = streamText({
+      model: this.buildChatModel(),
+      ...request,
+      tools: tools as any,
+      toolChoice: tools ? "auto" : undefined,
+      maxSteps: tools ? 5 : undefined,
+      onError: ({ error }) => {
+        streamError = error;
       },
     });
-  }
-
-  private supportsToolCalling(): boolean {
-    // OpenRouter provides a unified interface for tool calling across most modern models.
-    // Instead of a strict whitelist, we now allow tool calling by default.
-    return true;
-  }
-
-  private isLikelyCodeQuery(text: string): boolean {
-    // Treat almost everything as a potential code query to avoid hallucinations
-    // unless it's extremely short or clearly just social filler.
-    if (text.length < 3) return false;
-
-    // Broaden regex to include common question words in EN and PT
-    return /(where|implement|function|class|method|module|file|path|src\/|\.ts|\.js|\.tsx|\.jsx|error|bug|fix|stack|trace|why|what|how|who|list|tell|explain|que|como|onde|quem|fazer|mostra|explica|ajuda|projeto|build|context)/i
-      .test(text);
+    let text = "";
+    for await (const delta of result.textStream) text += delta;
+    if (streamError !== undefined) throw normalizeStreamError(streamError);
+    return text;
   }
 
   async generateSummary(
@@ -202,7 +232,7 @@ export class Summarizer {
     previousSummary?: string,
     userIntent?: string,
   ): Promise<string> {
-    this.assertConfigured();
+    await this.assertConfigured();
     logger.debug("AI", `Generating summary for ${events.length} events`);
 
     const eventCounts = events
@@ -236,8 +266,7 @@ export class Summarizer {
     logger.aiRequest(prompt.length);
 
     try {
-      const { text } = await generateText({
-        model: this.buildChatModel(),
+      const text = await this.requestText({
         maxTokens: maxTokensByLevel[this.frequencyLevel],
         system,
         prompt,
@@ -323,7 +352,7 @@ export class Summarizer {
     previousSummary?: string,
     userIntent?: string,
   ): Promise<string> {
-    this.assertConfigured();
+    await this.assertConfigured();
     const system = this.buildSummarySystemPrompt();
     const prompt = this.buildDiffSummaryPrompt(
       diffSummary,
@@ -339,8 +368,7 @@ export class Summarizer {
 
     logger.aiRequest(prompt.length);
 
-    const { text } = await generateText({
-      model: this.buildChatModel(),
+    const text = await this.requestText({
       maxTokens: maxTokensByLevel[this.frequencyLevel],
       system,
       prompt,
@@ -355,11 +383,8 @@ export class Summarizer {
   }
 
   async generateChat(input: GenerateChatInput): Promise<string> {
-    this.assertConfigured();
-    const useTools =
-      Boolean(input.tools) &&
-      this.supportsToolCalling() &&
-      this.isLikelyCodeQuery(input.userMessage);
+    await this.assertConfigured();
+    const useTools = Boolean(input.tools);
     const system = this.buildChatSystemPrompt();
     const messages = this.buildChatMessages({
       userMessage: input.userMessage,
@@ -369,10 +394,7 @@ export class Summarizer {
       workingMemory: input.workingMemory,
       userIntent: input.userIntent,
       useTools,
-      fallbackContext:
-        !useTools && this.isLikelyCodeQuery(input.userMessage)
-          ? input.fallbackContext
-          : undefined,
+      fallbackContext: useTools ? undefined : input.fallbackContext,
     });
 
     try {
@@ -414,7 +436,7 @@ export class Summarizer {
     messages: StoredMessage[],
     previousChatSummary?: string,
   ): Promise<string> {
-    this.assertConfigured();
+    await this.assertConfigured();
     const transcript = messages
       .map((message) => {
         const role = message.role.toUpperCase();
@@ -439,8 +461,7 @@ export class Summarizer {
 
     logger.aiRequest(prompt.length);
 
-    const { text } = await generateText({
-      model: this.buildChatModel(),
+    const text = await this.requestText({
       system,
       prompt,
       maxTokens: 320,
@@ -458,7 +479,7 @@ export class Summarizer {
     messages: StoredMessage[],
     currentMemory: Record<string, string>,
   ): Promise<Record<string, string | null>> {
-    this.assertConfigured();
+    await this.assertConfigured();
 
     const transcript = messages
       .map((message) => {
@@ -500,8 +521,7 @@ export class Summarizer {
     logger.aiRequest(prompt.length);
 
     try {
-      const { text } = await generateText({
-        model: this.buildChatModel(),
+      const text = await this.requestText({
         system: "You are a precise memory extraction agent. Return JSON only.",
         prompt,
       });
@@ -523,13 +543,15 @@ export class Summarizer {
   async generateProactiveInsight(
     input: GenerateProactiveInsightInput,
   ): Promise<ProactiveInsight> {
-    this.assertConfigured();
+    await this.assertConfigured();
 
     const sections: string[] = [];
     sections.push(
       "Analyze the current coding session and return a single JSON object ONLY.",
       "Your goal is to infer the user's short-term objective, identify their current technical focus, and provide a high-value suggestion.",
       "HIGH-SIGNAL ADVICE: Your suggestionText must be highly specific, actionable, and technically relevant. Identify potential bugs, architectural gaps, or the immediate next logical implementation step.",
+      "When making claims about project files, inspect them with the available project tools first.",
+      "Never discuss tool or filesystem access, and never ask the user to run ls, paste files, or restart the session. If the available evidence is insufficient for a concrete suggestion, set shouldNotify=false.",
       "Assess the status of the previous suggestion (active, addressed, ignored, or irrelevant).",
       "NOTIFICATION RULE: Set shouldNotify=true whenever you have a concrete, helpful suggestion. Only set shouldNotify=false if the recent activity is purely trivial (e.g. whitespace only) or if there is no clear direction yet.",
       'Return JSON with keys: goal, focus, status, suggestionKey, suggestionText, relatedFiles, shouldNotify.',
@@ -591,12 +613,12 @@ export class Summarizer {
     const timeout = setTimeout(() => abortController.abort(), 30_000);
 
     try {
-      const { text } = await generateText({
-        model: this.buildChatModel(),
+      const text = await this.requestText({
         system: this.buildSummarySystemPrompt(),
         prompt,
         maxTokens: 800,
         abortSignal: abortController.signal,
+        tools: input.tools,
       });
 
       clearTimeout(timeout);
@@ -616,7 +638,7 @@ export class Summarizer {
   async generateDebugDiagnosis(
     input: GenerateDebugDiagnosisInput,
   ): Promise<DebugDiagnosis> {
-    this.assertConfigured();
+    await this.assertConfigured();
 
     const sections: string[] = [
       "Analyze this failed managed dev run and return a single JSON object only.",
@@ -691,8 +713,7 @@ export class Summarizer {
     const prompt = shield.sanitize(sections.join("\n\n"));
     logger.aiRequest(prompt.length);
 
-    const { text } = await generateText({
-      model: this.buildChatModel(),
+    const text = await this.requestText({
       system: this.buildSummarySystemPrompt(),
       prompt,
       maxTokens: 900,
@@ -736,6 +757,7 @@ export class Summarizer {
     try {
       await input.onStatus?.("Thinking...");
 
+      let streamError: unknown;
       const result = await streamText({
         model: this.buildChatModel(),
         system: input.system,
@@ -757,6 +779,9 @@ export class Summarizer {
               }
             }
           : undefined,
+        onError: ({ error }) => {
+          streamError = error;
+        },
       });
 
       let fullText = "";
@@ -767,6 +792,9 @@ export class Summarizer {
         }
       }
 
+      if (streamError !== undefined) {
+        throw normalizeStreamError(streamError);
+      }
       if (fullText.trim().length === 0) {
         throw new Error("Empty response returned from AI provider");
       }

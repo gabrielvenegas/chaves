@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { readFile, stat } from "fs/promises";
 import { createTwoFilesPatch } from "diff";
 import { relative } from "path";
@@ -25,8 +26,7 @@ export class DiffTracker {
   private readonly maxFileSize = 1024 * 1024; // 1MB limit
 
   private computeHash(content: string): string {
-    const crypto = require("crypto");
-    return crypto.createHash("sha256").update(content).digest("hex");
+    return createHash("sha256").update(content).digest("hex");
   }
 
   private normalizePath(fullPath: string): string {

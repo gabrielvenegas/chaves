@@ -1,15 +1,10 @@
 import type { createInterface } from "readline/promises";
 import chalk from "chalk";
 import { logger } from "./logger.js";
+import type { AiModelInfo, AiProvider } from "./providers/types.js";
 import type { Store } from "./store.js";
 
 type Readline = ReturnType<typeof createInterface>;
-
-interface Model {
-  id: string;
-  name: string;
-  description?: string;
-}
 
 interface Language {
   code: string;
@@ -24,7 +19,7 @@ const theme = {
   danger: chalk.hex("#f56565"),
 };
 
-export const POPULAR_MODELS: Model[] = [
+export const POPULAR_MODELS: AiModelInfo[] = [
   {
     id: "anthropic/claude-3.5-haiku",
     name: "Claude 3.5 Haiku",
@@ -90,19 +85,37 @@ export class ModelSetup {
 
   async selectModel(
     rl: Readline,
-    options: { defaultModelId?: string } = {},
+    options: {
+      provider?: AiProvider;
+      defaultModelId?: string;
+    } = {},
   ): Promise<string | null> {
     logger.info("MODEL_SETUP", "Starting model selection...");
 
+    const provider = options.provider ?? {
+      id: "openrouter" as const,
+      displayName: "OpenRouter",
+      async getAuthStatus() {
+        return { state: "ready" as const };
+      },
+      getModel() {
+        throw new Error("The setup model catalog does not create models.");
+      },
+      async listModels() {
+        return POPULAR_MODELS;
+      },
+    };
+    const models = await provider.listModels();
+
     const defaultIndex = Math.max(
       1,
-      POPULAR_MODELS.findIndex((model) => model.id === options.defaultModelId) +
+      models.findIndex((model) => model.id === options.defaultModelId) +
         1 || 1,
     );
 
-    console.log(theme.text("Available OpenRouter models:\n"));
+    console.log(theme.text(`Available ${provider.displayName} models:\n`));
 
-    POPULAR_MODELS.forEach((model, index) => {
+    models.forEach((model, index) => {
       const num = index + 1;
       const badges = [
         model.id === options.defaultModelId ? theme.success("current") : "",
@@ -116,11 +129,15 @@ export class ModelSetup {
       }
     });
 
+    const allowsCustomModel = provider.id === "openrouter";
+    if (allowsCustomModel) {
+      console.log(
+        `\n${theme.accent(`${models.length + 1}.`)} ${theme.text("Enter custom model ID")}`,
+      );
+    }
+    const cancelIndex = models.length + (allowsCustomModel ? 2 : 1);
     console.log(
-      `\n${theme.accent(`${POPULAR_MODELS.length + 1}.`)} ${theme.text("Enter custom model ID")}`,
-    );
-    console.log(
-      `${theme.accent(`${POPULAR_MODELS.length + 2}.`)} ${theme.text("Cancel")}\n`,
+      `${theme.accent(`${cancelIndex}.`)} ${theme.text("Cancel")}\n`,
     );
 
     const choice = await rl.question(
@@ -131,18 +148,18 @@ export class ModelSetup {
     if (
       !Number.isFinite(selection) ||
       selection < 1 ||
-      selection > POPULAR_MODELS.length + 2
+      selection > cancelIndex
     ) {
       console.log(theme.danger("Invalid selection. Please try again.\n"));
       return this.selectModel(rl, options);
     }
 
-    if (selection === POPULAR_MODELS.length + 2) {
+    if (selection === cancelIndex) {
       logger.info("MODEL_SETUP", "Model selection cancelled by user");
       return null;
     }
 
-    if (selection === POPULAR_MODELS.length + 1) {
+    if (allowsCustomModel && selection === models.length + 1) {
       const customModel = await rl.question(
         `${theme.accent("Enter model ID")}${
           options.defaultModelId
@@ -164,7 +181,7 @@ export class ModelSetup {
       return modelId;
     }
 
-    const selectedModel = POPULAR_MODELS[selection - 1]!;
+    const selectedModel = models[selection - 1]!;
     console.log(
       `\n${theme.success("Selected")}: ${theme.text(selectedModel.name)} ${theme.muted(`(${selectedModel.id})`)}\n`,
     );

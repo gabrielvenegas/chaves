@@ -6,7 +6,7 @@ An AI-powered coding companion that watches IDE activity in real-time, tracks fi
 
 - **TypeScript** (strict, ESNext) executed via `tsx`
 - **Node.js ES modules**
-- **@ai-sdk/openai** + **ai** (Vercel AI SDK) — OpenRouter as LLM gateway
+- **ai** (Vercel AI SDK) with **@openrouter/ai-sdk-provider** for OpenRouter and **@ai-sdk/openai** Responses models for Codex subscription access
 - **better-sqlite3** — persistent SQLite per project (`.chaves.db`)
 - **chokidar** — file system watcher
 - **blessed** — terminal UI
@@ -17,10 +17,20 @@ An AI-powered coding companion that watches IDE activity in real-time, tracks fi
 ```bash
 bun start [project-path]    # Run chaves in current or specified directory
 bun run dev                 # Hot reload (tsx watch)
-bun run setup [project-path] # Configure model/language
+bun run setup [project-path] # Focused maintenance menu
+bun start --onboarding [project-path] # Force the complete onboarding flow
+bun run typecheck           # TypeScript verification
 ```
 
-First run triggers an interactive onboarding wizard that collects your OpenRouter API key and stores it per-project. Pass `--onboarding` to re-run it.
+First run triggers the complete interactive onboarding wizard: provider/account,
+provider-scoped model, language, response preferences, and terminal capture.
+Pass `--onboarding` to force that full flow. `--setup` is deliberately separate
+and offers six focused actions: change model; change provider/account; sign in
+again; change language; other preferences; or cancel.
+
+The supported authentication choices are ChatGPT browser login for a Codex
+subscription and a per-project OpenRouter API key. There is no direct OpenAI
+API-key provider.
 
 ## Optional Environment
 
@@ -33,7 +43,8 @@ First run triggers an interactive onboarding wizard that collects your OpenRoute
 Watcher (chokidar)
   → DiffTracker (unified diffs)
   → Store (SQLite: events, diffs, messages, files, config)
-  → Summarizer (OpenRouter LLM)
+  → AiProvider (OpenRouter or Codex subscription)
+  → Summarizer (provider-neutral AI SDK calls)
   → UI (blessed chat terminal)
   → Tools (chaves-tools: AI-callable DB tools)
 ```
@@ -48,7 +59,15 @@ Watcher (chokidar)
 | `src/store.ts` | SQLite layer; events, messages, summaries, files, config |
 | `src/watcher.ts` | chokidar file watcher; idle detection (30s) |
 | `src/diff-tracker.ts` | Diff calculation; caches previous content in-memory |
-| `src/summarizer.ts` | LLM calls via OpenRouter; proactive summaries + chat |
+| `src/summarizer.ts` | Provider-neutral AI SDK calls; proactive summaries, diagnosis, and chat |
+| `src/providers/types.ts` | `AiProvider` contract, model metadata, auth status, and typed auth errors |
+| `src/providers/factory.ts` | Constructs OpenRouter or Codex provider and the shared Codex auth manager |
+| `src/providers/openrouter.ts` | OpenRouter model construction, API-key status, and remote model catalog |
+| `src/providers/codex/auth.ts` | Codex credential lifecycle, serialized refresh, and reauthentication state |
+| `src/providers/codex/credentials.ts` | Global private credential-path resolution and atomic JSON storage |
+| `src/providers/codex/oauth.ts` | Browser OAuth Authorization Code + PKCE flow and token refresh |
+| `src/providers/codex/fetch.ts` | Authenticated Codex transport, request rewrite, and one 401 retry |
+| `src/providers/codex/provider.ts` | AI SDK OpenAI Responses adapter and provider-scoped Codex catalog |
 | `src/indexer.ts` | Startup codebase indexing with FTS5 support |
 | `src/ui.ts` | Terminal UI orchestration |
 | `src/ui/chat.ts` | blessed chat component |
@@ -57,7 +76,9 @@ Watcher (chokidar)
 | `src/shield.ts` | Security: blocks sensitive files, sanitizes API keys from content |
 | `src/file-rules.ts` | File classification: ignored patterns, binary extensions, language detection |
 | `src/onboarding.ts` | First-run wizard |
-| `src/modelSetup.ts` | Model + language selection UI |
+| `src/modelSetup.ts` | Provider-aware model and language selection UI |
+| `src/configurationSections.ts` | Shared onboarding/setup sections without merging the two flows |
+| `src/setup.ts` | Focused six-option maintenance wizard |
 
 ## Database Schema (`.chaves.db`)
 
@@ -67,7 +88,7 @@ Watcher (chokidar)
 - `messages` — chat history (role, channel, session_id)
 - `chat_summaries` — rolling conversation summaries
 - `files` — indexed project files with FTS5 virtual table
-- `config` — key/value store (model, language, api key, frequency, personality)
+- `config` — per-project key/value store (provider, model, language, OpenRouter key, frequency, personality, terminal command)
 
 ## Security (Shield)
 
@@ -78,11 +99,27 @@ Three-layer protection applied at file blocking → content scanning → prompt 
 
 ## Configuration (stored in `.chaves.db`)
 
+- **ai_provider** — `openrouter` or `codex`; missing values default to OpenRouter for backward compatibility
 - **openrouter_api_key** — stored OpenRouter API key (BYOK, per-project)
-- **model** — active LLM model ID
-- **language** — UI/output language
+- **summary_model** — active provider-scoped LLM model ID
+- **response_language** — UI/output language
 - **message_frequency_level** — 1 (conservative), 2 (normal), 3 (aggressive)
 - **personality** — technical, collaborative, or creative
+- **dev_command** — optional command captured in the managed tmux pane
+
+Codex credentials are not project configuration. They are stored globally at
+`$XDG_CONFIG_HOME/chaves/codex-auth.json`, `~/.config/chaves/codex-auth.json`,
+or `%APPDATA%\chaves\codex-auth.json`. POSIX directory/file permissions are
+`0700`/`0600`, and writes are atomic. Access tokens refresh automatically. A
+second `401` after one forced refresh blocks further background AI calls and
+shows exactly:
+
+`Your ChatGPT session expired. Run chaves --setup, choose Sign in again, then restart Chaves.`
+
+The TUI `/setup` command is informational only. It reports the active provider
+and directs the user to run `chaves --setup`; no `/auth`, `/login`, or `/logout`
+commands exist. `/model` listing, search, and selection use only the active
+provider's catalog.
 
 ## Notes
 
